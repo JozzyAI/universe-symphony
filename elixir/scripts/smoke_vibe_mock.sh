@@ -7,37 +7,30 @@
 #   - Remote nodes or relay
 #
 # Requires:
-#   - Elixir / mix (via mise)
-#   - vibe-interface-cli built (npm run build)
+#   - vibe CLI (install: cd vibe-interface-cli && npm install && npm run build && npm link)
 #
 # Usage:
-#   VIBE_CLI=/path/to/vibe-interface-cli/dist/src/index.js scripts/smoke_vibe_mock.sh
+#   bash elixir/scripts/smoke_vibe_mock.sh
+#
+# Override vibe location:
+#   VIBE_CMD="node /path/to/dist/src/index.js" bash elixir/scripts/smoke_vibe_mock.sh
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ELIXIR_DIR="$(dirname "$SCRIPT_DIR")"
-
 # ── Config ─────────────────────────────────────────────────────────────────
 
-VIBE_CLI="${VIBE_CLI:-}"
+# Default to the global `vibe` command from `npm link`.
+# Override via VIBE_CMD env for dev (e.g. VIBE_CMD="node /path/to/dist/src/index.js").
+VIBE_CMD="${VIBE_CMD:-vibe}"
 
-if [[ -z "$VIBE_CLI" ]]; then
-  # Try to find it relative to this repo
-  CANDIDATE="$(dirname "$ELIXIR_DIR")/../vibe-interface-cli/dist/src/index.js"
-  if [[ -f "$CANDIDATE" ]]; then
-    VIBE_CLI="$(realpath "$CANDIDATE")"
-  fi
-fi
-
-if [[ -z "$VIBE_CLI" ]] || ! [[ -f "$VIBE_CLI" ]]; then
-  echo "ERROR: vibe CLI not found. Set VIBE_CLI=/path/to/dist/src/index.js or build vibe-interface-cli first."
-  echo "  cd /path/to/vibe-interface-cli && npm run build"
+if ! $VIBE_CMD --version &>/dev/null; then
+  echo "ERROR: vibe CLI not found. Install it:"
+  echo "  git clone https://github.com/JozzyAI/vibe_interface_cli"
+  echo "  cd vibe_interface_cli && npm install && npm run build && npm link"
   exit 1
 fi
 
-VIBE_CMD="node $VIBE_CLI"
-echo "✓ vibe CLI: $VIBE_CLI"
+echo "✓ vibe: $($VIBE_CMD --version)"
 
 # ── Step 1: Verify vibe symphony start (mock) ───────────────────────────────
 

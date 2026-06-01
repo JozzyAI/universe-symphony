@@ -4,13 +4,29 @@
 # Skips cleanly if `claude` is not in PATH.
 #
 # Requires:
+#   - vibe CLI (install: cd vibe-interface-cli && npm install && npm run build && npm link)
 #   - claude CLI installed and authenticated
-#   - vibe-interface-cli built (npm run build)
 #
 # Usage:
-#   VIBE_CLI=/path/to/vibe-interface-cli/dist/src/index.js scripts/smoke_vibe_claude.sh
+#   bash elixir/scripts/smoke_vibe_claude.sh
+#
+# Override vibe location:
+#   VIBE_CMD="node /path/to/dist/src/index.js" bash elixir/scripts/smoke_vibe_claude.sh
 
 set -euo pipefail
+
+# ── Vibe CLI check ───────────────────────────────────────────────────────────
+
+VIBE_CMD="${VIBE_CMD:-vibe}"
+
+if ! $VIBE_CMD --version &>/dev/null; then
+  echo "ERROR: vibe CLI not found. Install it:"
+  echo "  git clone https://github.com/JozzyAI/vibe_interface_cli"
+  echo "  cd vibe_interface_cli && npm install && npm run build && npm link"
+  exit 1
+fi
+
+echo "✓ vibe: $($VIBE_CMD --version)"
 
 # ── Claude check ────────────────────────────────────────────────────────────
 
@@ -21,28 +37,6 @@ if ! command -v claude &>/dev/null; then
 fi
 
 echo "✓ claude: $(claude --version 2>/dev/null | head -1)"
-
-# ── Vibe CLI check ───────────────────────────────────────────────────────────
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ELIXIR_DIR="$(dirname "$SCRIPT_DIR")"
-
-VIBE_CLI="${VIBE_CLI:-}"
-
-if [[ -z "$VIBE_CLI" ]]; then
-  CANDIDATE="$(dirname "$ELIXIR_DIR")/../vibe-interface-cli/dist/src/index.js"
-  if [[ -f "$CANDIDATE" ]]; then
-    VIBE_CLI="$(realpath "$CANDIDATE")"
-  fi
-fi
-
-if [[ -z "$VIBE_CLI" ]] || ! [[ -f "$VIBE_CLI" ]]; then
-  echo "ERROR: vibe CLI not found. Set VIBE_CLI=/path/to/dist/src/index.js"
-  exit 1
-fi
-
-VIBE_CMD="node $VIBE_CLI"
-echo "✓ vibe CLI: $VIBE_CLI"
 
 # ── Write prompt file ────────────────────────────────────────────────────────
 
