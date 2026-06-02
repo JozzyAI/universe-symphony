@@ -356,7 +356,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+                 "vibe_run_id" => nil,
+                 "vibe_node_id" => nil,
+                 "vibe_agent" => nil
                }
              ],
              "retrying" => [
@@ -382,7 +385,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "blocked_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("blocked_at"),
                  "last_event" => "turn_input_required",
                  "last_message" => "turn blocked: waiting for user input",
-                 "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
+                 "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at"),
+                 "vibe_run_id" => nil,
+                 "vibe_node_id" => nil,
+                 "vibe_agent" => nil
                }
              ],
              "codex_totals" => %{
@@ -416,7 +422,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+               "vibe_run_id" => nil,
+               "vibe_node_id" => nil,
+               "vibe_agent" => nil
              },
              "retry" => nil,
              "blocked" => nil,

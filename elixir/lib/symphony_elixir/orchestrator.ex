@@ -632,7 +632,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
+    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required, :vibe_blocked] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
@@ -673,6 +673,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
+  defp codex_event_blocker_error(:vibe_blocked), do: "vibe run is blocked — operator input may be required"
   defp codex_event_blocker_error(_event), do: nil
 
   defp completion_blocker_error(completion) do
@@ -1446,8 +1447,19 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
+    # Vibe-specific fields are set once on :vibe_start and persist for the run lifetime.
+    vibe_fields = if event == :vibe_start do
+      %{
+        vibe_run_id: Map.get(update, :vibe_run_id),
+        vibe_node_id: Map.get(update, :vibe_node_id),
+        vibe_agent: Map.get(update, :vibe_agent),
+      }
+    else
+      %{}
+    end
+
     {
-      Map.merge(running_entry, %{
+      Map.merge(running_entry, Map.merge(%{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
@@ -1460,7 +1472,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
+      }, vibe_fields)),
       token_delta
     }
   end
