@@ -358,6 +358,7 @@ defmodule SymphonyElixir.CoreTest do
       )
 
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_render_delay = Application.get_env(:symphony_elixir, :poll_transition_render_delay_ms)
     issue_id = "issue-missing"
     issue_identifier = "MT-557"
 
@@ -371,19 +372,27 @@ defmodule SymphonyElixir.CoreTest do
       )
 
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+      # Set render delay to 0 so :tick → :run_poll_cycle is synchronizable via :sys.get_state.
+      Application.put_env(:symphony_elixir, :poll_transition_render_delay_ms, 0)
 
       orchestrator_name = Module.concat(__MODULE__, :MissingRunningIssueOrchestrator)
       {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
       on_exit(fn ->
         restore_app_env(:memory_tracker_issues, previous_memory_issues)
+        restore_app_env(:poll_transition_render_delay_ms, previous_render_delay)
 
         if Process.alive?(pid) do
           Process.exit(pid, :normal)
         end
       end)
 
-      Process.sleep(50)
+      # Drain the startup tick (init schedules tick with 0ms delay) and the
+      # subsequent :run_poll_cycle. Two :sys.get_state calls are needed because
+      # :run_poll_cycle is sent *during* tick handling, so it arrives after the
+      # first system message.
+      :sys.get_state(pid)
+      :sys.get_state(pid)
 
       assert {:ok, workspace} =
                SymphonyElixir.PathSafety.canonicalize(Path.join(test_root, issue_identifier))
@@ -415,7 +424,8 @@ defmodule SymphonyElixir.CoreTest do
       end)
 
       send(pid, :tick)
-      Process.sleep(100)
+      # :tick sends :run_poll_cycle via timer; two sync barriers drain both.
+      :sys.get_state(pid)
       state = :sys.get_state(pid)
 
       refute Map.has_key?(state.running, issue_id)
@@ -424,6 +434,7 @@ defmodule SymphonyElixir.CoreTest do
       assert File.exists?(workspace)
     after
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:poll_transition_render_delay_ms, previous_render_delay)
       File.rm_rf(test_root)
     end
   end
@@ -668,7 +679,6 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
@@ -709,7 +719,6 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
     state = :sys.get_state(pid)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
@@ -748,7 +757,6 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
     state = :sys.get_state(pid)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
@@ -787,7 +795,6 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:retry_issue, issue_id, stale_retry_token})
-    Process.sleep(50)
 
     assert %{
              attempt: 2,
