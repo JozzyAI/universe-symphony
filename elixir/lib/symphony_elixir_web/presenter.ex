@@ -150,7 +150,9 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(entry.last_codex_timestamp),
       vibe_run_id: Map.get(entry, :vibe_run_id),
       vibe_node_id: Map.get(entry, :vibe_node_id),
-      vibe_agent: Map.get(entry, :vibe_agent)
+      vibe_agent: Map.get(entry, :vibe_agent),
+      vibe_approval_id: Map.get(entry, :vibe_approval_id),
+      vibe_approval_message: Map.get(entry, :vibe_approval_message)
     }
   end
 
@@ -196,7 +198,12 @@ defmodule SymphonyElixirWeb.Presenter do
       blocked_at: iso8601(blocked.blocked_at),
       last_event: blocked.last_codex_event,
       last_message: summarize_message(blocked.last_codex_message),
-      last_event_at: iso8601(blocked.last_codex_timestamp)
+      last_event_at: iso8601(blocked.last_codex_timestamp),
+      vibe_run_id: Map.get(blocked, :vibe_run_id),
+      vibe_node_id: Map.get(blocked, :vibe_node_id),
+      vibe_agent: Map.get(blocked, :vibe_agent),
+      vibe_approval_id: Map.get(blocked, :vibe_approval_id),
+      vibe_approval_message: Map.get(blocked, :vibe_approval_message)
     }
   end
 

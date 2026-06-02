@@ -752,7 +752,12 @@ defmodule SymphonyElixir.Orchestrator do
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      vibe_run_id: Map.get(running_entry, :vibe_run_id),
+      vibe_node_id: Map.get(running_entry, :vibe_node_id),
+      vibe_agent: Map.get(running_entry, :vibe_agent),
+      vibe_approval_id: Map.get(running_entry, :vibe_approval_id),
+      vibe_approval_message: Map.get(running_entry, :vibe_approval_message)
     }
 
     %{
@@ -1338,6 +1343,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec vibe_approve(String.t(), String.t(), String.t(), String.t() | nil) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def vibe_approve(issue_id, approval_id, decision, message \\ nil) do
+    vibe_approve(__MODULE__, issue_id, approval_id, decision, message)
+  end
+
+  @spec vibe_approve(GenServer.server(), String.t(), String.t(), String.t(), String.t() | nil) ::
+          {:ok, map()} | {:error, term()} | :unavailable
+  def vibe_approve(server, issue_id, approval_id, decision, message) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:vibe_approve, issue_id, approval_id, decision, message})
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1380,7 +1401,10 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          runtime_seconds: running_seconds(metadata.started_at, now),
+          vibe_run_id: Map.get(metadata, :vibe_run_id),
+          vibe_node_id: Map.get(metadata, :vibe_node_id),
+          vibe_agent: Map.get(metadata, :vibe_agent)
         }
       end)
 
@@ -1412,7 +1436,12 @@ defmodule SymphonyElixir.Orchestrator do
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          vibe_run_id: Map.get(metadata, :vibe_run_id),
+          vibe_node_id: Map.get(metadata, :vibe_node_id),
+          vibe_agent: Map.get(metadata, :vibe_agent),
+          vibe_approval_id: Map.get(metadata, :vibe_approval_id),
+          vibe_approval_message: Map.get(metadata, :vibe_approval_message)
         }
       end)
 
@@ -1429,6 +1458,11 @@ defmodule SymphonyElixir.Orchestrator do
          poll_interval_ms: state.poll_interval_ms
        }
      }, state}
+  end
+
+  def handle_call({:vibe_approve, issue_id, approval_id, decision, message}, _from, state) do
+    result = do_vibe_approve(state, issue_id, approval_id, decision, message)
+    {:reply, result, state}
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -1449,6 +1483,44 @@ defmodule SymphonyElixir.Orchestrator do
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
 
+  defp do_vibe_approve(state, issue_id, approval_id, decision, message) do
+    case find_blocked_by_issue_id(state, issue_id) do
+      nil ->
+        {:error, :not_blocked}
+
+      blocked_entry ->
+        run_id = Map.get(blocked_entry, :vibe_run_id)
+        stored_approval_id = Map.get(blocked_entry, :vibe_approval_id)
+
+        cond do
+          is_nil(run_id) ->
+            {:error, :missing_vibe_run_id}
+
+          is_nil(stored_approval_id) ->
+            {:error, :missing_vibe_approval_id}
+
+          stored_approval_id != approval_id ->
+            {:error, {:approval_id_mismatch, stored_approval_id, approval_id}}
+
+          true ->
+            config = Config.settings!()
+            SymphonyElixir.Codex.ExternalExecutor.send_approval(
+              config.external.command,
+              run_id,
+              approval_id,
+              decision,
+              config.external.relay,
+              config.external.token,
+              message
+            )
+        end
+    end
+  end
+
+  defp find_blocked_by_issue_id(state, issue_id) do
+    Map.get(state.blocked, issue_id)
+  end
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
@@ -1460,16 +1532,25 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    # Vibe-specific fields are set once on :vibe_start and persist for the run lifetime.
-    vibe_fields = if event == :vibe_start do
-      %{
-        vibe_run_id: Map.get(update, :vibe_run_id),
-        vibe_node_id: Map.get(update, :vibe_node_id),
-        vibe_agent: Map.get(update, :vibe_agent),
-      }
-    else
-      %{}
-    end
+    # Vibe-specific fields: run metadata set once on :vibe_start; approval fields on :approval_required.
+    vibe_fields =
+      cond do
+        event == :vibe_start ->
+          %{
+            vibe_run_id: Map.get(update, :vibe_run_id),
+            vibe_node_id: Map.get(update, :vibe_node_id),
+            vibe_agent: Map.get(update, :vibe_agent)
+          }
+
+        event == :approval_required ->
+          %{
+            vibe_approval_id: Map.get(update, :approval_id),
+            vibe_approval_message: Map.get(update, :message)
+          }
+
+        true ->
+          %{}
+      end
 
     {
       Map.merge(running_entry, Map.merge(%{
