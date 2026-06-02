@@ -31,7 +31,7 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     ACTION="$2"
     case "$ACTION" in
       start)
-        echo '{"run_id":"test-run-1","session_id":"sess-1","node_id":"local","agent":"mock","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
+        echo '{"run_id":"test-run-1","session_id":"sess-1","node_id":"enc-node-1","agent":"mock","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
         ;;
       stream)
         RUN_ID="${3:-test-run-1}"
@@ -90,6 +90,70 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     """)
   end
 
+  # Fake vibe that emits status:blocked
+  defp vibe_status_blocked! do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    case "$ACTION" in
+      start)
+        echo '{"run_id":"status-blocked-run-1","session_id":"sess-sb","node_id":"local","agent":"mock","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
+        ;;
+      stream)
+        RUN_ID="${3:-status-blocked-run-1}"
+        echo "{\\"type\\":\\"status\\",\\"status\\":\\"running\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:00Z\\"}"
+        echo "{\\"type\\":\\"status\\",\\"status\\":\\"blocked\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:01Z\\"}"
+        ;;
+      stop)
+        echo "{\\"run_id\\":\\"${3:-status-blocked-run-1}\\",\\"status\\":\\"stopped\\"}"
+        ;;
+    esac
+    """)
+  end
+
+  # Fake vibe that emits pr_created then completes
+  defp vibe_pr_created! do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    case "$ACTION" in
+      start)
+        echo '{"run_id":"pr-run-1","session_id":"sess-pr","node_id":"local","agent":"mock","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
+        ;;
+      stream)
+        RUN_ID="${3:-pr-run-1}"
+        echo "{\\"type\\":\\"log\\",\\"stream\\":\\"stdout\\",\\"message\\":\\"Creating PR...\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:00Z\\"}"
+        echo "{\\"type\\":\\"pr_created\\",\\"url\\":\\"https://github.com/org/repo/pull/42\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:01Z\\"}"
+        echo "{\\"type\\":\\"status\\",\\"status\\":\\"completed\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:02Z\\"}"
+        ;;
+      stop)
+        echo "{\\"run_id\\":\\"${3:-pr-run-1}\\",\\"status\\":\\"stopped\\"}"
+        ;;
+    esac
+    """)
+  end
+
+  # Fake vibe that emits approval_response then completes
+  defp vibe_approval_response! do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    case "$ACTION" in
+      start)
+        echo '{"run_id":"ar-run-1","session_id":"sess-ar","node_id":"local","agent":"mock","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
+        ;;
+      stream)
+        RUN_ID="${3:-ar-run-1}"
+        echo "{\\"type\\":\\"approval_response\\",\\"approval_id\\":\\"appr-2\\",\\"decision\\":\\"approve\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:00Z\\"}"
+        echo "{\\"type\\":\\"status\\",\\"status\\":\\"completed\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:01Z\\"}"
+        ;;
+      stop)
+        echo "{\\"run_id\\":\\"${3:-ar-run-1}\\",\\"status\\":\\"stopped\\"}"
+        ;;
+    esac
+    """)
+  end
+
   # Fake vibe where start returns bad JSON
   defp vibe_bad_start! do
     write_fake_vibe!(~s"""
@@ -119,7 +183,7 @@ defmodule SymphonyElixir.ExternalExecutorTest do
 
   # ── ExternalExecutor.run/4 tests ───────────────────────────────────────────
 
-  test "completed stream returns :ok and forwards log + tool_call events" do
+  test "completed stream returns :ok and forwards log + tool_call + vibe_start events" do
     cmd = vibe_completed!()
     issue = fake_issue()
     messages = :ets.new(:messages, [:public, :bag])
@@ -130,6 +194,48 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     events = :ets.tab2list(messages)
     assert Enum.any?(events, fn {k, _} -> k == :output end)
     assert Enum.any?(events, fn {k, _} -> k == :tool_call end)
+    assert Enum.any?(events, fn {k, _} -> k == :vibe_start end)
+  end
+
+  test "vibe_start event includes run_id, node_id, and agent" do
+    cmd = vibe_completed!()
+    issue = fake_issue()
+    messages = :ets.new(:vibe_start_msgs, [:public, :bag])
+    on_msg = fn msg -> :ets.insert(messages, {msg.event, msg}) end
+
+    assert :ok = ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock", on_message: on_msg)
+
+    [{:vibe_start, start_event}] = :ets.lookup(messages, :vibe_start)
+    assert start_event.vibe_run_id == "test-run-1"
+    assert start_event.vibe_node_id == "enc-node-1"
+    assert start_event.vibe_agent == "mock"
+    assert %DateTime{} = start_event.timestamp
+  end
+
+  test "tool_call event includes input field" do
+    cmd = vibe_completed!()
+    issue = fake_issue()
+    messages = :ets.new(:tool_call_msgs, [:public, :bag])
+    on_msg = fn msg -> :ets.insert(messages, {msg.event, msg}) end
+
+    assert :ok = ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock", on_message: on_msg)
+
+    [{:tool_call, tc_event}] = :ets.lookup(messages, :tool_call)
+    assert tc_event.tool == "bash"
+    assert tc_event.input == %{"cmd" => "ls"}
+  end
+
+  test "log event includes stream field" do
+    cmd = vibe_completed!()
+    issue = fake_issue()
+    messages = :ets.new(:log_msgs, [:public, :bag])
+    on_msg = fn msg -> :ets.insert(messages, {msg.event, msg}) end
+
+    assert :ok = ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock", on_message: on_msg)
+
+    [{:output, log_event}] = :ets.lookup(messages, :output)
+    assert log_event.message == "Working..."
+    assert log_event.stream == "stdout"
   end
 
   test "failed stream returns error tuple" do
@@ -139,16 +245,55 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     assert {:error, _reason} = ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock")
   end
 
-  test "approval_required returns blocked error" do
+  test "approval_required returns blocked error with approval_id and message fields" do
     cmd = vibe_blocked!()
     issue = fake_issue()
     received = :ets.new(:approvals, [:public, :bag])
-    on_msg = fn msg -> :ets.insert(received, {msg.event}) end
+    on_msg = fn msg -> :ets.insert(received, {msg.event, msg}) end
 
     assert {:error, {:blocked, :approval_required, _event}} =
              ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock", on_message: on_msg)
 
-    assert :ets.lookup(received, :approval_required) != []
+    [{:approval_required, appr_event}] = :ets.lookup(received, :approval_required)
+    assert appr_event.approval_id == "appr-1"
+    assert appr_event.message == "Proceed?"
+  end
+
+  test "status:blocked returns blocked error with vibe_blocked event" do
+    cmd = vibe_status_blocked!()
+    issue = fake_issue()
+    received = :ets.new(:status_blocked, [:public, :bag])
+    on_msg = fn msg -> :ets.insert(received, {msg.event, msg}) end
+
+    assert {:error, {:blocked, :status_blocked, _event}} =
+             ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock", on_message: on_msg)
+
+    assert :ets.lookup(received, :vibe_blocked) != []
+  end
+
+  test "pr_created event is forwarded and run completes" do
+    cmd = vibe_pr_created!()
+    issue = fake_issue()
+    received = :ets.new(:pr_events, [:public, :bag])
+    on_msg = fn msg -> :ets.insert(received, {msg.event, msg}) end
+
+    assert :ok = ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock", on_message: on_msg)
+
+    [{:pr_created, pr_event}] = :ets.lookup(received, :pr_created)
+    assert pr_event.url == "https://github.com/org/repo/pull/42"
+  end
+
+  test "approval_response event is forwarded and run completes" do
+    cmd = vibe_approval_response!()
+    issue = fake_issue()
+    received = :ets.new(:ar_events, [:public, :bag])
+    on_msg = fn msg -> :ets.insert(received, {msg.event, msg}) end
+
+    assert :ok = ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock", on_message: on_msg)
+
+    [{:approval_response, ar_event}] = :ets.lookup(received, :approval_response)
+    assert ar_event.approval_id == "appr-2"
+    assert ar_event.decision == "approve"
   end
 
   test "command not found returns error" do

@@ -4,13 +4,31 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
 
   Unlike AppServer, there is no JSON-RPC handshake. This executor:
     1. Calls `<command> symphony start` and captures the run_id.
-    2. Opens `<command> symphony stream <run_id> --jsonl` via a Port.
-    3. Maps Vibe JSONL events to the standard on_message callback format.
-    4. Returns :ok on completed, {:error, reason} on failed/stopped/blocked/crash.
-    5. Calls `<command> symphony stop <run_id>` on abnormal exit to clean up.
+    2. Emits a :vibe_start on_message event with run_id, node_id, and agent.
+    3. Opens `<command> symphony stream <run_id> --jsonl` via a Port.
+    4. Maps Vibe JSONL events to the standard on_message callback format.
+    5. Returns :ok on completed, {:error, reason} on failed/stopped/blocked/crash.
+    6. Calls `<command> symphony stop <run_id>` on abnormal exit to clean up.
 
   Codex (AppServer) remains the default path. This module is only invoked when
   the WORKFLOW.md sets `agent_kind: vibe`.
+
+  ## Event mapping
+
+  | Vibe event type   | on_message event atom | Notes                                       |
+  |-------------------|-----------------------|---------------------------------------------|
+  | status:running    | (ignored)             | Informational — run already started         |
+  | log               | :output               | message, stream fields                      |
+  | tool_call         | :tool_call            | tool and input fields                       |
+  | approval_required | :approval_required    | approval_id, message — then returns blocked |
+  | approval_response | :approval_response    | approval_id, decision — non-blocking        |
+  | pr_created        | :pr_created           | url — non-blocking                          |
+  | status:blocked    | :vibe_blocked         | then returns {:error, {:blocked, ...}}      |
+  | status:completed  | (no on_message)       | returns :ok                                 |
+  | status:failed     | (no on_message)       | returns {:error, {:failed, event}}          |
+  | status:stopped    | (no on_message)       | returns {:error, {:stopped, event}}         |
+  | status:cancelled  | (no on_message)       | returns {:error, {:cancelled, event}}       |
+  | error             | (no on_message)       | logs warning, returns {:error, {:run_error, event}} |
   """
 
   require Logger
@@ -32,8 +50,17 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     prompt_file = write_temp_prompt!(prompt, issue)
 
     try do
-      with {:ok, run_id} <- start_run(command, agent, issue, prompt_file, node, relay, token, permission_mode) do
-        stream_run(command, run_id, relay, token, on_message)
+      with {:ok, run_meta} <- start_run(command, agent, issue, prompt_file, node, relay, token, permission_mode) do
+        # Announce Vibe run metadata so the orchestrator can display run_id/node/agent in the UI.
+        on_message.(%{
+          event: :vibe_start,
+          vibe_run_id: run_meta.run_id,
+          vibe_node_id: run_meta.node_id,
+          vibe_agent: run_meta.agent,
+          timestamp: DateTime.utc_now(),
+        })
+
+        stream_run(command, run_meta.run_id, relay, token, on_message)
       end
     after
       File.rm(prompt_file)
@@ -62,9 +89,13 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
       case System.cmd(command, args, stderr_to_stdout: false) do
         {output, 0} ->
           case Jason.decode(String.trim(output)) do
-            {:ok, %{"run_id" => run_id}} when is_binary(run_id) ->
+            {:ok, %{"run_id" => run_id} = record} when is_binary(run_id) ->
               Logger.info("ExternalExecutor: started run_id=#{run_id}")
-              {:ok, run_id}
+              {:ok, %{
+                run_id: run_id,
+                node_id: Map.get(record, "node_id"),
+                agent: Map.get(record, "agent", agent),
+              }}
 
             {:ok, other} ->
               {:error, {:invalid_start_response, other}}
@@ -149,21 +180,63 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     {:error, {String.to_atom(terminal), event}}
   end
 
+  defp handle_event(%{"type" => "status", "status" => "blocked"} = event, port, run_id, _command, _relay, _token, on_message) do
+    Logger.info("ExternalExecutor: blocked run_id=#{run_id}")
+    on_message.(%{event: :vibe_blocked, raw: event, timestamp: DateTime.utc_now()})
+    close_port(port)
+    {:error, {:blocked, :status_blocked, event}}
+  end
+
   defp handle_event(%{"type" => "log", "message" => message} = event, port, run_id, command, relay, token, on_message) do
-    on_message.(%{event: :output, message: message, raw: event, timestamp: DateTime.utc_now()})
+    on_message.(%{
+      event: :output,
+      message: message,
+      stream: Map.get(event, "stream", "stdout"),
+      raw: event,
+      timestamp: DateTime.utc_now()
+    })
     await_stream(port, run_id, command, relay, token, on_message)
   end
 
   defp handle_event(%{"type" => "tool_call", "tool" => tool} = event, port, run_id, command, relay, token, on_message) do
-    on_message.(%{event: :tool_call, tool: tool, raw: event, timestamp: DateTime.utc_now()})
+    on_message.(%{
+      event: :tool_call,
+      tool: tool,
+      input: Map.get(event, "input"),
+      raw: event,
+      timestamp: DateTime.utc_now()
+    })
     await_stream(port, run_id, command, relay, token, on_message)
   end
 
   defp handle_event(%{"type" => "approval_required"} = event, port, run_id, _command, _relay, _token, on_message) do
-    Logger.info("ExternalExecutor: approval_required run_id=#{run_id}")
-    on_message.(%{event: :approval_required, raw: event, timestamp: DateTime.utc_now()})
+    Logger.info("ExternalExecutor: approval_required run_id=#{run_id} approval_id=#{Map.get(event, "approval_id")}")
+    on_message.(%{
+      event: :approval_required,
+      approval_id: Map.get(event, "approval_id"),
+      message: Map.get(event, "message"),
+      raw: event,
+      timestamp: DateTime.utc_now()
+    })
     close_port(port)
     {:error, {:blocked, :approval_required, event}}
+  end
+
+  defp handle_event(%{"type" => "approval_response"} = event, port, run_id, command, relay, token, on_message) do
+    on_message.(%{
+      event: :approval_response,
+      approval_id: Map.get(event, "approval_id"),
+      decision: Map.get(event, "decision"),
+      raw: event,
+      timestamp: DateTime.utc_now()
+    })
+    await_stream(port, run_id, command, relay, token, on_message)
+  end
+
+  defp handle_event(%{"type" => "pr_created", "url" => url} = event, port, run_id, command, relay, token, on_message) do
+    Logger.info("ExternalExecutor: pr_created run_id=#{run_id} url=#{url}")
+    on_message.(%{event: :pr_created, url: url, raw: event, timestamp: DateTime.utc_now()})
+    await_stream(port, run_id, command, relay, token, on_message)
   end
 
   defp handle_event(%{"type" => "error", "message" => message} = event, port, run_id, command, relay, token, _on_message) do

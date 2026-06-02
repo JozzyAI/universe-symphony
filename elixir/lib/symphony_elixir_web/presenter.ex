@@ -116,7 +116,10 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
-      }
+      },
+      vibe_run_id: Map.get(entry, :vibe_run_id),
+      vibe_node_id: Map.get(entry, :vibe_node_id),
+      vibe_agent: Map.get(entry, :vibe_agent)
     }
   end
 
@@ -144,7 +147,10 @@ defmodule SymphonyElixirWeb.Presenter do
       blocked_at: iso8601(entry.blocked_at),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
-      last_event_at: iso8601(entry.last_codex_timestamp)
+      last_event_at: iso8601(entry.last_codex_timestamp),
+      vibe_run_id: Map.get(entry, :vibe_run_id),
+      vibe_node_id: Map.get(entry, :vibe_node_id),
+      vibe_agent: Map.get(entry, :vibe_agent)
     }
   end
 
@@ -163,7 +169,10 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
-      }
+      },
+      vibe_run_id: Map.get(running, :vibe_run_id),
+      vibe_node_id: Map.get(running, :vibe_node_id),
+      vibe_agent: Map.get(running, :vibe_agent)
     }
   end
 
