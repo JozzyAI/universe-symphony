@@ -29,9 +29,12 @@ set -euo pipefail
 VIBE_CMD="${VIBE_CMD:-vibe}"
 RELAY_PORT="${RELAY_PORT:-7434}"
 RELAY_TOKEN="${RELAY_TOKEN:-dev-approval}"
-NODE_ID="${NODE_ID:-approval-node}"
 RELAY_URL="ws://localhost:${RELAY_PORT}"
 APPROVAL_TIMEOUT=20  # seconds to wait for approval_required event
+
+# NODE_ID is derived from the node's identity after pairing (not set upfront).
+# With --require-pairing the relay matches on identity.id; --node-id overrides must match.
+NODE_ID=""
 
 RELAY_PID=""
 DAEMON_PID=""
@@ -111,18 +114,28 @@ PAIR_OUT=$($VIBE_CMD node pair \
   --token "$RELAY_TOKEN")
 
 echo "pair output: $PAIR_OUT"
-echo "✓ node identity registered"
+
+# Extract the node_id assigned by the identity (stable across pair + daemon).
+# The daemon will use the same identity.id when no --node-id override is given.
+NODE_ID=$(jget "$PAIR_OUT" "node_id")
+
+if [[ -z "$NODE_ID" ]]; then
+  echo "ERROR: could not extract node_id from pair output"
+  exit 1
+fi
+
+echo "✓ node identity registered (node_id=$NODE_ID)"
 
 # ── Step 3: Start node daemon ──────────────────────────────────────────────
 
 echo ""
 echo "── Step 3: start node daemon (node_id=$NODE_ID) ──"
+echo "   (no --node-id override: daemon uses identity.id to match the paired node)"
 
 VIBE_NODE_HEARTBEAT_MS=500 \
   $VIBE_CMD node daemon --local \
     --relay "$RELAY_URL" \
     --token "$RELAY_TOKEN" \
-    --node-id "$NODE_ID" \
     &>/dev/null &
 DAEMON_PID=$!
 
