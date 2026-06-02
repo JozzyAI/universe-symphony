@@ -51,6 +51,47 @@ claude --version
 
 ---
 
+## WORKFLOW.md config — remote Vibe Node via relay
+
+Dispatch runs to a remote Vibe Node through the plaintext dev relay.
+
+> ⚠️ **Relay is plaintext localhost dev mode.** E2E encryption is planned for a future release.
+> Ensure the relay is accessible from both the Symphony host and the worker node.
+
+```yaml
+agent_kind: vibe
+external:
+  command: node /path/to/vibe-interface-cli/dist/src/index.js
+  agent: claude-code
+  node: my-node              # node_id registered with the relay
+  relay: ws://localhost:7433  # relay WebSocket URL
+  token: dev                 # relay auth token
+  permission_mode: unsafe-skip  # optional — enables --dangerously-skip-permissions
+```
+
+Setup (3 terminals):
+
+```bash
+# Terminal 1 — relay
+vibe relay dev --port 7433 --token dev
+
+# Terminal 2 — worker node
+vibe node daemon --local \
+  --relay ws://localhost:7433 \
+  --token dev \
+  --node-id my-node
+
+# Terminal 3 — Symphony (uses WORKFLOW.md above)
+cd symphony/elixir && mix symphony.run
+```
+
+Smoke test:
+```bash
+bash elixir/scripts/smoke_vibe_relay.sh
+```
+
+---
+
 ## WORKFLOW.md config — mock agent (safe, no API key)
 
 ```yaml
