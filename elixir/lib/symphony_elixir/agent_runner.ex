@@ -94,6 +94,10 @@ defmodule SymphonyElixir.AgentRunner do
       ExternalExecutor.run(issue, prompt, workspace,
         command: config.external.command,
         agent: config.external.agent,
+        node: config.external.node,
+        relay: config.external.relay,
+        token: config.external.token,
+        permission_mode: config.external.permission_mode,
         on_message: on_message
       )
     else
