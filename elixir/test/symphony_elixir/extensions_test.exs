@@ -77,6 +77,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  # An orchestrator that handles :vibe_approve calls with a configurable reply.
+  defmodule VibeOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    def init(opts), do: {:ok, opts}
+
+    def handle_call(:snapshot, _from, state) do
+      {:reply, Keyword.fetch!(state, :snapshot), state}
+    end
+
+    def handle_call(:request_refresh, _from, state) do
+      {:reply, Keyword.get(state, :refresh, :unavailable), state}
+    end
+
+    def handle_call({:vibe_approve, _issue_id, _approval_id, _decision, _message}, _from, state) do
+      {:reply, Keyword.fetch!(state, :approve_reply), state}
+    end
+  end
+
   setup do
     linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
 
@@ -388,7 +412,9 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at"),
                  "vibe_run_id" => nil,
                  "vibe_node_id" => nil,
-                 "vibe_agent" => nil
+                 "vibe_agent" => nil,
+                 "vibe_approval_id" => nil,
+                 "vibe_approval_message" => nil
                }
              ],
              "codex_totals" => %{
@@ -499,6 +525,140 @@ defmodule SymphonyElixir.ExtensionsTest do
                }
              }
   end
+
+  # ── Vibe approve API tests ─────────────────────────────────────────────────
+
+  test "POST /api/v1/:issue_identifier/approve returns ok when vibe_approve succeeds" do
+    orchestrator_name = Module.concat(__MODULE__, :VibeApproveOkOrchestrator)
+    approve_result = %{"ok" => true, "run_id" => "run-99", "approval_id" => "appr-1", "decision" => "approve"}
+
+    start_supervised!({VibeOrchestrator,
+      name: orchestrator_name,
+      snapshot: vibe_blocked_snapshot(),
+      approve_reply: {:ok, approve_result}
+    })
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn = post(build_conn(), "/api/v1/MT-VIBE-BLOCKED/approve", %{
+      "approval_id" => "appr-1",
+      "decision" => "approve"
+    })
+
+    assert %{"ok" => true, "run_id" => "run-99", "issue_identifier" => "MT-VIBE-BLOCKED"} =
+             json_response(conn, 200)
+  end
+
+  test "POST /api/v1/:issue_identifier/approve returns ok for deny decision" do
+    orchestrator_name = Module.concat(__MODULE__, :VibeApproveDenyOrchestrator)
+    approve_result = %{"ok" => true, "run_id" => "run-99", "approval_id" => "appr-1", "decision" => "deny"}
+
+    start_supervised!({VibeOrchestrator,
+      name: orchestrator_name,
+      snapshot: vibe_blocked_snapshot(),
+      approve_reply: {:ok, approve_result}
+    })
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn = post(build_conn(), "/api/v1/MT-VIBE-BLOCKED/approve", %{
+      "approval_id" => "appr-1",
+      "decision" => "deny"
+    })
+
+    assert %{"ok" => true, "decision" => "deny"} = json_response(conn, 200)
+  end
+
+  test "POST /api/v1/:issue_identifier/approve returns 422 when approval_id missing" do
+    orchestrator_name = Module.concat(__MODULE__, :VibeApproveMissingIdOrchestrator)
+
+    start_supervised!({VibeOrchestrator,
+      name: orchestrator_name,
+      snapshot: vibe_blocked_snapshot(),
+      approve_reply: {:ok, %{}}
+    })
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn = post(build_conn(), "/api/v1/MT-VIBE-BLOCKED/approve", %{"decision" => "approve"})
+
+    assert %{"error" => %{"code" => "missing_approval_id"}} = json_response(conn, 422)
+  end
+
+  test "POST /api/v1/:issue_identifier/approve returns 422 for invalid decision" do
+    orchestrator_name = Module.concat(__MODULE__, :VibeApproveInvalidDecisionOrchestrator)
+
+    start_supervised!({VibeOrchestrator,
+      name: orchestrator_name,
+      snapshot: vibe_blocked_snapshot(),
+      approve_reply: {:ok, %{}}
+    })
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn = post(build_conn(), "/api/v1/MT-VIBE-BLOCKED/approve", %{
+      "approval_id" => "appr-1",
+      "decision" => "maybe"
+    })
+
+    assert %{"error" => %{"code" => "invalid_decision"}} = json_response(conn, 422)
+  end
+
+  test "POST /api/v1/:issue_identifier/approve returns 404 when issue not found or not blocked" do
+    orchestrator_name = Module.concat(__MODULE__, :VibeApproveNotBlockedOrchestrator)
+
+    start_supervised!({VibeOrchestrator,
+      name: orchestrator_name,
+      snapshot: vibe_blocked_snapshot(),
+      approve_reply: {:ok, %{}}
+    })
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn = post(build_conn(), "/api/v1/MT-NONEXISTENT/approve", %{
+      "approval_id" => "appr-1",
+      "decision" => "approve"
+    })
+
+    assert %{"error" => %{"code" => "issue_not_found"}} = json_response(conn, 404)
+  end
+
+  test "POST /api/v1/:issue_identifier/approve returns 422 when missing_vibe_run_id" do
+    orchestrator_name = Module.concat(__MODULE__, :VibeApproveMissingRunIdOrchestrator)
+
+    start_supervised!({VibeOrchestrator,
+      name: orchestrator_name,
+      snapshot: vibe_blocked_snapshot(),
+      approve_reply: {:error, :missing_vibe_run_id}
+    })
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn = post(build_conn(), "/api/v1/MT-VIBE-BLOCKED/approve", %{
+      "approval_id" => "appr-1",
+      "decision" => "approve"
+    })
+
+    assert %{"error" => %{"code" => "missing_vibe_run_id"}} = json_response(conn, 422)
+  end
+
+  test "GET /api/v1/:issue_identifier/approve returns 405 method not allowed" do
+    orchestrator_name = Module.concat(__MODULE__, :VibeApprove405Orchestrator)
+
+    start_supervised!({VibeOrchestrator,
+      name: orchestrator_name,
+      snapshot: vibe_blocked_snapshot(),
+      approve_reply: {:ok, %{}}
+    })
+
+    start_test_endpoint(orchestrator: orchestrator_name)
+
+    conn = get(build_conn(), "/api/v1/MT-VIBE-BLOCKED/approve")
+
+    assert %{"error" => %{"code" => "method_not_allowed"}} = json_response(conn, 405)
+  end
+
+  # ── End Vibe approve API tests ─────────────────────────────────────────────
 
   test "phoenix observability api preserves snapshot timeout behavior" do
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
@@ -771,6 +931,33 @@ defmodule SymphonyElixir.ExtensionsTest do
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
+    }
+  end
+
+  defp vibe_blocked_snapshot do
+    %{
+      running: [],
+      retrying: [],
+      blocked: [
+        %{
+          issue_id: "issue-vibe-blocked",
+          identifier: "MT-VIBE-BLOCKED",
+          state: "In Progress",
+          error: "vibe run is blocked — operator input may be required",
+          session_id: "sess-vibe",
+          blocked_at: DateTime.utc_now(),
+          last_codex_event: :approval_required,
+          last_codex_message: nil,
+          last_codex_timestamp: DateTime.utc_now(),
+          vibe_run_id: "run-99",
+          vibe_node_id: "node-1",
+          vibe_agent: "mock",
+          vibe_approval_id: "appr-1",
+          vibe_approval_message: "Proceed with deletion?"
+        }
+      ],
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0.0},
+      rate_limits: %{}
     }
   end
 

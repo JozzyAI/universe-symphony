@@ -328,6 +328,89 @@ defmodule SymphonyElixir.ExternalExecutorTest do
              ExternalExecutor.run(issue, "prompt", "/tmp", command: cmd, agent: "mock")
   end
 
+  # ── ExternalExecutor.send_approval/7 tests ────────────────────────────────
+
+  # Fake vibe approval CLI: echoes back a JSON result for any approval respond call
+  defp vibe_approval_cli! do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    if [ "$SUBCOMMAND" = "approval" ] && [ "$ACTION" = "respond" ]; then
+      RUN_ID=""
+      APPROVAL_ID=""
+      DECISION=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --run-id) shift; RUN_ID="$1" ;;
+          --approval-id) shift; APPROVAL_ID="$1" ;;
+          --decision) shift; DECISION="$1" ;;
+        esac
+        shift
+      done
+      echo "{\\"ok\\":true,\\"run_id\\":\\"$RUN_ID\\",\\"approval_id\\":\\"$APPROVAL_ID\\",\\"decision\\":\\"$DECISION\\"}"
+    else
+      echo "unexpected subcommand" >&2
+      exit 1
+    fi
+    """)
+  end
+
+  # Fake vibe approval CLI: exits non-zero to simulate CLI failure
+  defp vibe_approval_cli_fails! do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    if [ "$SUBCOMMAND" = "approval" ] && [ "$ACTION" = "respond" ]; then
+      echo "relay error" >&2
+      exit 2
+    fi
+    """)
+  end
+
+  test "send_approval approve returns ok with result map" do
+    cmd = vibe_approval_cli!()
+
+    assert {:ok, result} =
+             ExternalExecutor.send_approval(cmd, "run-1", "appr-1", "approve", "ws://relay", "token123")
+
+    assert result["ok"] == true
+    assert result["run_id"] == "run-1"
+    assert result["approval_id"] == "appr-1"
+    assert result["decision"] == "approve"
+  end
+
+  test "send_approval deny returns ok with result map" do
+    cmd = vibe_approval_cli!()
+
+    assert {:ok, result} =
+             ExternalExecutor.send_approval(cmd, "run-2", "appr-2", "deny", "ws://relay", "token456")
+
+    assert result["decision"] == "deny"
+    assert result["run_id"] == "run-2"
+  end
+
+  test "send_approval returns relay_not_configured when relay is nil" do
+    assert {:error, :relay_not_configured} =
+             ExternalExecutor.send_approval("vibe", "run-1", "appr-1", "approve", nil, "token")
+  end
+
+  test "send_approval returns relay_not_configured when token is nil" do
+    assert {:error, :relay_not_configured} =
+             ExternalExecutor.send_approval("vibe", "run-1", "appr-1", "approve", "ws://relay", nil)
+  end
+
+  test "send_approval returns command_not_found for nonexistent command" do
+    assert {:error, {:command_not_found, "/no/such/vibe"}} =
+             ExternalExecutor.send_approval("/no/such/vibe", "run-1", "appr-1", "approve", "ws://relay", "tok")
+  end
+
+  test "send_approval returns approval_failed on non-zero exit" do
+    cmd = vibe_approval_cli_fails!()
+
+    assert {:error, {:approval_failed, 2, _}} =
+             ExternalExecutor.send_approval(cmd, "run-1", "appr-1", "approve", "ws://relay", "token")
+  end
+
   # ── Config schema tests ────────────────────────────────────────────────────
 
   test "agent_kind defaults to codex when not in workflow" do

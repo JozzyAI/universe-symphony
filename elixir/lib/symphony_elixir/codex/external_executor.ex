@@ -250,6 +250,45 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     await_stream(port, run_id, command, relay, token, on_message)
   end
 
+  @spec send_approval(String.t(), String.t(), String.t(), String.t(), String.t() | nil, String.t() | nil, String.t() | nil) ::
+          {:ok, map()} | {:error, term()}
+  def send_approval(command, run_id, approval_id, decision, relay, token, message \\ nil)
+
+  def send_approval(_command, _run_id, _approval_id, _decision, relay, token, _message)
+      when not is_binary(relay) or not is_binary(token) do
+    {:error, :relay_not_configured}
+  end
+
+  def send_approval(command, run_id, approval_id, decision, relay, token, message) do
+    args =
+      [
+        "approval", "respond",
+        "--run-id", run_id,
+        "--approval-id", approval_id,
+        "--decision", decision,
+        "--relay", relay,
+        "--token", token
+      ]
+      |> then(fn a -> if is_binary(message), do: a ++ ["--message", message], else: a end)
+
+    Logger.info("ExternalExecutor: approval respond run_id=#{run_id} approval_id=#{approval_id} decision=#{decision}")
+
+    try do
+      case System.cmd(command, args, stderr_to_stdout: false) do
+        {output, 0} ->
+          case Jason.decode(String.trim(output)) do
+            {:ok, result} -> {:ok, result}
+            {:error, reason} -> {:error, {:invalid_approval_response_json, reason, output}}
+          end
+
+        {output, code} ->
+          {:error, {:approval_failed, code, output}}
+      end
+    rescue
+      ErlangError -> {:error, {:command_not_found, command}}
+    end
+  end
+
   defp stop_run(command, run_id, relay, token) do
     args =
       ["symphony", "stop", run_id]
