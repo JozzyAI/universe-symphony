@@ -162,14 +162,15 @@ defmodule SymphonyElixir.Config.Schema do
       # Remote relay fields — set these to dispatch runs to a remote Vibe Node.
       field(:node, :string)               # node_id of the remote worker (e.g. "my-node")
       field(:relay, :string)              # relay WebSocket URL (e.g. "ws://localhost:7433")
-      field(:token, :string)              # relay auth token
+      field(:token, :string)              # relay auth token; supports $ENV_VAR syntax
+      field(:encrypt, :boolean)           # true → pass --encrypt to vibe symphony start
       field(:permission_mode, :string)    # "default" | "unsafe-skip"
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:command, :agent, :node, :relay, :token, :permission_mode], empty_values: [])
+      |> cast(attrs, [:command, :agent, :node, :relay, :token, :encrypt, :permission_mode], empty_values: [])
     end
   end
 
