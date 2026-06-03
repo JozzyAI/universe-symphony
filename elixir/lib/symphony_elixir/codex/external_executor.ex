@@ -45,12 +45,13 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     node = Keyword.get(opts, :node)
     relay = Keyword.get(opts, :relay)
     token = Keyword.get(opts, :token)
+    encrypt = Keyword.get(opts, :encrypt)
     permission_mode = Keyword.get(opts, :permission_mode)
 
     prompt_file = write_temp_prompt!(prompt, issue)
 
     try do
-      with {:ok, run_meta} <- start_run(command, agent, issue, prompt_file, node, relay, token, permission_mode) do
+      with {:ok, run_meta} <- start_run(command, agent, issue, prompt_file, node, relay, token, encrypt, permission_mode) do
         # Announce Vibe run metadata so the orchestrator can display run_id/node/agent in the UI.
         on_message.(%{
           event: :vibe_start,
@@ -69,7 +70,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
 
   # ── Internal ───────────────────────────────────────────────────────────────
 
-  defp start_run(command, agent, issue, prompt_file, node, relay, token, permission_mode) do
+  defp start_run(command, agent, issue, prompt_file, node, relay, token, encrypt, permission_mode) do
     args =
       [
         "symphony", "start",
@@ -81,6 +82,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
         "--json"
       ]
       |> append_relay_args(node, relay, token)
+      |> append_encrypt(encrypt, relay)
       |> append_permission_mode(permission_mode)
 
     Logger.info("ExternalExecutor: #{command} symphony start issue_id=#{issue.id} node=#{inspect(node)} relay=#{inspect(relay)}")
@@ -314,6 +316,11 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   end
 
   defp append_relay_stream_args(args, _relay, _token), do: args
+
+  # Only add --encrypt when relay is configured and encrypt is explicitly true.
+  # Encrypting local runs has no effect (no relay to be blind to the payload).
+  defp append_encrypt(args, true, relay) when is_binary(relay), do: args ++ ["--encrypt"]
+  defp append_encrypt(args, _encrypt, _relay), do: args
 
   defp append_permission_mode(args, mode) when is_binary(mode) and mode != "default" do
     args ++ ["--permission-mode", mode]

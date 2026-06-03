@@ -97,6 +97,7 @@ defmodule SymphonyElixir.AgentRunner do
         node: config.external.node,
         relay: config.external.relay,
         token: config.external.token,
+        encrypt: config.external.encrypt,
         permission_mode: config.external.permission_mode,
         on_message: on_message
       )
