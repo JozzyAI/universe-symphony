@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
+           :ok <- maybe_clone_repo(workspace, issue_context, created?, worker_host),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
         {:ok, workspace}
       end
@@ -222,6 +223,53 @@ defmodule SymphonyElixir.Workspace do
 
       false ->
         :ok
+    end
+  end
+
+  defp maybe_clone_repo(workspace, issue_context, created?, worker_host) do
+    repo_config = Config.settings!().repo
+
+    case {repo_config.url, created?} do
+      {nil, _} ->
+        :ok
+
+      {url, true} ->
+        branch = repo_branch_name(issue_context, repo_config.branch_prefix)
+
+        command =
+          "git clone --depth 1 #{shell_escape(url)} . && git checkout -b #{shell_escape(branch)}"
+
+        run_hook(command, workspace, issue_context, "repo_clone", worker_host)
+
+      {_url, false} ->
+        verify_git_remote(workspace, issue_context, worker_host)
+    end
+  end
+
+  defp repo_branch_name(%{issue_identifier: identifier}, nil), do: identifier
+
+  defp repo_branch_name(%{issue_identifier: identifier}, prefix) when is_binary(prefix) do
+    "#{prefix}/#{identifier}"
+  end
+
+  defp verify_git_remote(workspace, _issue_context, nil) do
+    case System.cmd("git", ["-C", workspace, "remote", "get-url", "origin"],
+           stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {_output, _status} ->
+        {:error, {:workspace_missing_git_remote, workspace}}
+    end
+  end
+
+  defp verify_git_remote(workspace, _issue_context, worker_host) when is_binary(worker_host) do
+    script = "git -C #{shell_escape(workspace)} remote get-url origin"
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {_output, _status}} -> {:error, {:workspace_missing_git_remote, workspace}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
