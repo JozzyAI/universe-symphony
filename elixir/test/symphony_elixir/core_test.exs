@@ -103,10 +103,14 @@ defmodule SymphonyElixir.CoreTest do
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
-    repo = Map.get(config, "repo", %{})
-    assert is_map(repo)
-    assert is_binary(Map.get(repo, "url"))
-    assert Map.get(repo, "url") =~ "github.com"
+    binding = Map.get(config, "binding", %{})
+    assert is_map(binding)
+    assert is_map(Map.get(binding, "nodes", %{}))
+    assert map_size(Map.get(binding, "nodes", %{})) > 0
+    defaults = Map.get(binding, "defaults", %{})
+    assert is_map(defaults)
+    assert is_binary(Map.get(defaults, "repo"))
+    assert Map.get(defaults, "repo") =~ "github.com"
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())

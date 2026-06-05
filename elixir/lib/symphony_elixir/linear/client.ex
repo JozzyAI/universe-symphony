@@ -31,6 +31,13 @@ defmodule SymphonyElixir.Linear.Client do
             name
           }
         }
+        project {
+          labels {
+            nodes {
+              name
+            }
+          }
+        }
         inverseRelations(first: $relationFirst) {
           nodes {
             type
@@ -74,6 +81,13 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+          }
+        }
+        project {
+          labels {
+            nodes {
+              name
+            }
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -460,6 +474,7 @@ defmodule SymphonyElixir.Linear.Client do
       assignee_id: assignee_field(assignee, "id"),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
+      project_labels: extract_project_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
@@ -537,6 +552,15 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_assignee_match_value(_value), do: nil
+
+  defp extract_project_labels(%{"project" => %{"labels" => %{"nodes" => labels}}}) when is_list(labels) do
+    labels
+    |> Enum.map(& &1["name"])
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&String.downcase/1)
+  end
+
+  defp extract_project_labels(_), do: []
 
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels

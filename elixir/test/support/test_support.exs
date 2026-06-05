@@ -22,7 +22,14 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0
+        ]
+
+      alias SymphonyElixir.Binding
 
       setup do
         workflow_root =
@@ -111,6 +118,7 @@ defmodule SymphonyElixir.TestSupport do
           agent_kind: "codex",
           repo_url: nil,
           repo_branch_prefix: nil,
+          binding: nil,
           codex_command: "codex app-server",
           external_command: "vibe",
           external_agent: "mock",
@@ -154,6 +162,7 @@ defmodule SymphonyElixir.TestSupport do
     agent_kind = Keyword.get(config, :agent_kind)
     repo_url = Keyword.get(config, :repo_url)
     repo_branch_prefix = Keyword.get(config, :repo_branch_prefix)
+    binding = Keyword.get(config, :binding)
     external_command = Keyword.get(config, :external_command)
     external_agent = Keyword.get(config, :external_agent)
     codex_command = Keyword.get(config, :codex_command)
@@ -199,6 +208,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "agent_kind: #{yaml_value(agent_kind)}",
         repo_yaml(repo_url, repo_branch_prefix),
+        binding_yaml(binding),
         "external:",
         "  command: #{yaml_value(external_command)}",
         "  agent: #{yaml_value(external_agent)}",
@@ -253,6 +263,90 @@ defmodule SymphonyElixir.TestSupport do
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
+  end
+
+  # binding is a raw YAML string block for test flexibility.
+  # Pass pre-formatted YAML (without the top-level "binding:" key) as the value,
+  # or pass a map: %{nodes: %{...}, agents: %{...}, defaults: %{...}, repo_policy: %{...}}.
+  defp binding_yaml(nil), do: nil
+
+  defp binding_yaml(raw) when is_binary(raw), do: raw
+
+  defp binding_yaml(%{} = spec) do
+    lines = ["binding:"]
+
+    lines =
+      if rp = Map.get(spec, :repo_policy) do
+        orgs = Map.get(rp, :allowed_github_orgs, [])
+
+        lines ++
+          [
+            "  repo_policy:",
+            "    allowed_github_orgs:"
+          ] ++ Enum.map(orgs, &"      - #{yaml_value(&1)}")
+      else
+        lines
+      end
+
+    lines =
+      if nodes = Map.get(spec, :nodes) do
+        node_lines =
+          Enum.flat_map(nodes, fn {name, cfg} ->
+            relay = Map.get(cfg, :relay)
+            token = Map.get(cfg, :token)
+            agents = Map.get(cfg, :allowed_agents, [])
+
+            [
+              "    #{name}:"
+            ] ++
+              (relay && ["      relay: #{yaml_value(relay)}"] || []) ++
+              (token && ["      token: #{yaml_value(token)}"] || []) ++
+              (agents != [] &&
+                 ["      allowed_agents:"] ++ Enum.map(agents, &"        - #{yaml_value(&1)}") ||
+                 [])
+          end)
+
+        lines ++ ["  nodes:"] ++ node_lines
+      else
+        lines
+      end
+
+    lines =
+      if agents = Map.get(spec, :agents) do
+        agent_lines =
+          Enum.flat_map(agents, fn {name, cfg} ->
+            pm = Map.get(cfg, :permission_mode, "default")
+            ["    #{name}:", "      permission_mode: #{yaml_value(pm)}"]
+          end)
+
+        lines ++ ["  agents:"] ++ agent_lines
+      else
+        lines
+      end
+
+    lines =
+      if defaults = Map.get(spec, :defaults) do
+        d_lines =
+          Enum.flat_map(
+            [
+              {:repo, Map.get(defaults, :repo)},
+              {:repo_branch_prefix, Map.get(defaults, :repo_branch_prefix)},
+              {:node, Map.get(defaults, :node)},
+              {:agent, Map.get(defaults, :agent)},
+              {:encrypt, Map.get(defaults, :encrypt)}
+            ],
+            fn
+              {_k, nil} -> []
+              {k, v} -> ["    #{k}: #{yaml_value(v)}"]
+            end
+          )
+
+        lines ++ ["  defaults:"] ++ d_lines
+      else
+        lines
+      end
+
+    Enum.join(lines, "\n")
   end
 
   defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"

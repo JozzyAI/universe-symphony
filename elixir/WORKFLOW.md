@@ -16,21 +16,39 @@ polling:
   interval_ms: 10000
 workspace:
   root: ~/symphony-workspaces
-repo:
-  url: https://github.com/JozzyAI/fin_bot
-  branch_prefix: linear
 agent:
   max_concurrent_agents: 4
   max_turns: 20
 agent_kind: vibe
 external:
   command: vibe
-  agent: claude-code
-  node: node_f7cedd3b6590aff9
-  relay: wss://vibe-relay.dynastylab.ai
-  token: $VIBE_RELAY_TOKEN
-  encrypt: true
-  permission_mode: unsafe-skip
+binding:
+  repo_policy:
+    allowed_github_orgs:
+      - JozzyAI
+
+  nodes:
+    company-node:
+      relay: wss://vibe-relay.dynastylab.ai
+      token: $VIBE_RELAY_TOKEN
+      node_id: node_f7cedd3b6590aff9
+      allowed_agents:
+        - mock
+        - claude-code
+
+  agents:
+    mock:
+      permission_mode: default
+
+    claude-code:
+      permission_mode: unsafe-skip
+
+  defaults:
+    repo: https://github.com/JozzyAI/fin_bot
+    repo_branch_prefix: linear
+    node: company-node
+    agent: claude-code
+    encrypt: true
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
