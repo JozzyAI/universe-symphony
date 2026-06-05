@@ -6,6 +6,8 @@ tracker:
   active_states:
     - Todo
     - In Progress
+    - Rework
+    - Merging
   terminal_states:
     - Done
     - Canceled
@@ -61,7 +63,7 @@ Instructions:
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
 2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
-4. Never merge a PR. Open the PR, move the ticket to Human Review, and stop. Merging is the human's decision.
+4. Do not merge a PR unless the Linear issue is explicitly in the `Merging` state. Do not infer merge approval from PR creation, green CI, or absence of comments. If the workspace does not define a `Merging` state, stop at `Human Review` and wait for a human.
 
 Work only in the provided repository copy. Do not touch any other path.
 
@@ -105,7 +107,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `In Progress` -> implementation actively underway.
 - `Human Review` -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
-- `Rework` -> reviewer requested changes; planning + implementation required.
+- `Rework` -> human has requested changes; run the rework flow (see below) and return to `Human Review` when done.
 - `Done` -> terminal state; no further action required.
 
 ## Step 0: Determine current ticket state and route
@@ -119,7 +121,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `In Progress` -> continue execution flow from current scratchpad comment.
    - `Human Review` -> wait and poll for decision/review updates.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
-   - `Rework` -> run rework flow.
+   - `Rework` -> run rework flow: gather PR feedback, implement changes, re-validate, push, return issue to `Human Review`.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
@@ -176,6 +178,19 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 4. Update the workpad plan/checklist to include each feedback item and its resolution status.
 5. Re-run validation after feedback-driven changes and push updates.
 6. Repeat this sweep until there are no outstanding actionable comments.
+
+## Rework flow
+
+When the ticket enters `Rework` state the human has reviewed the PR and requested changes. Run this flow in full before returning to `Human Review`:
+
+1. Fetch all PR feedback from every channel (same as the PR feedback sweep protocol above).
+2. Open the workpad comment and add each feedback item as a new TODO checkbox under the existing plan.
+3. For every actionable comment, either update code/tests/docs to address it, or post an explicit justified pushback reply on that thread.
+4. Push the updated branch.
+5. Re-run all validation required for the scope; confirm it passes.
+6. Run a final PR feedback sweep — no outstanding actionable comments may remain.
+7. Move the issue from `Rework` back to `Human Review`.
+8. Stop. Do not merge or transition to `Merging` — that gate is the human's explicit action.
 
 ## Blocked-access escape hatch (required behavior)
 
