@@ -10,9 +10,9 @@ defmodule SymphonyElixir.Workspace do
 
   @type worker_host :: String.t() | nil
 
-  @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, Path.t()} | {:error, term()}
-  def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+  def create_for_issue(issue_or_identifier, worker_host \\ nil, opts \\ []) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -21,7 +21,7 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_clone_repo(workspace, issue_context, created?, worker_host),
+           :ok <- maybe_clone_repo(workspace, issue_context, created?, worker_host, opts),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
         {:ok, workspace}
       end
@@ -226,15 +226,25 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_clone_repo(workspace, issue_context, created?, worker_host) do
-    repo_config = Config.settings!().repo
+  defp maybe_clone_repo(workspace, issue_context, created?, worker_host, opts) do
+    # Prefer explicit opts (passed by AgentRunner after binding resolution),
+    # fall back to legacy config.repo for direct callers and tests.
+    {repo_url, branch_prefix} =
+      case Keyword.get(opts, :repo_url) do
+        nil ->
+          repo_config = Config.settings!().repo
+          {repo_config.url, repo_config.branch_prefix}
 
-    case {repo_config.url, created?} do
+        url ->
+          {url, Keyword.get(opts, :repo_branch_prefix)}
+      end
+
+    case {repo_url, created?} do
       {nil, _} ->
         :ok
 
       {url, true} ->
-        branch = repo_branch_name(issue_context, repo_config.branch_prefix)
+        branch = repo_branch_name(issue_context, branch_prefix)
 
         command =
           "git clone --depth 1 #{shell_escape(url)} . && git checkout -b #{shell_escape(branch)}"

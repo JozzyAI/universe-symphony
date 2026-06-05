@@ -192,6 +192,65 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Binding do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    defmodule Defaults do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:repo, :string)
+        field(:repo_branch_prefix, :string)
+        field(:node, :string)
+        field(:agent, :string)
+        field(:encrypt, :boolean, default: false)
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema |> cast(attrs, [:repo, :repo_branch_prefix, :node, :agent, :encrypt], empty_values: [])
+      end
+    end
+
+    defmodule RepoPolicy do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:allowed_github_orgs, {:array, :string}, default: [])
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema |> cast(attrs, [:allowed_github_orgs], empty_values: [])
+      end
+    end
+
+    embedded_schema do
+      field(:nodes, :map, default: %{})
+      field(:agents, :map, default: %{})
+      embeds_one(:defaults, Defaults, on_replace: :update, defaults_to_struct: true)
+      embeds_one(:repo_policy, RepoPolicy, on_replace: :update, defaults_to_struct: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:nodes, :agents])
+      |> cast_embed(:defaults, with: &Defaults.changeset/2)
+      |> cast_embed(:repo_policy, with: &RepoPolicy.changeset/2)
+    end
+  end
+
   defmodule Codex do
     @moduledoc false
     use Ecto.Schema
@@ -313,6 +372,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:external, External, on_replace: :update, defaults_to_struct: true)
     embeds_one(:repo, Repo, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:binding, Binding, on_replace: :update)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -407,6 +467,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:external, with: &External.changeset/2)
     |> cast_embed(:repo, with: &Repo.changeset/2)
+    |> cast_embed(:binding, with: &Binding.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -415,6 +476,12 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp validate_vibe_repo_config(changeset) do
     agent_kind = get_field(changeset, :agent_kind)
+
+    has_binding =
+      case get_field(changeset, :binding) do
+        %{nodes: nodes} when is_map(nodes) and map_size(nodes) > 0 -> true
+        _ -> false
+      end
 
     repo_url =
       case get_field(changeset, :repo) do
@@ -428,8 +495,8 @@ defmodule SymphonyElixir.Config.Schema do
         _ -> nil
       end
 
-    if agent_kind == "vibe" and is_nil(repo_url) and is_nil(after_create) do
-      add_error(changeset, :repo, "url required when agent_kind is vibe (or configure hooks.after_create for legacy behavior)")
+    if agent_kind == "vibe" and not has_binding and is_nil(repo_url) and is_nil(after_create) do
+      add_error(changeset, :repo, "url required when agent_kind is vibe (or configure binding with nodes, or hooks.after_create for legacy behavior)")
     else
       changeset
     end
@@ -463,7 +530,21 @@ defmodule SymphonyElixir.Config.Schema do
       | url: resolve_url_setting(settings.repo.url)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex, external: external, repo: repo}
+    binding = finalize_binding(settings.binding)
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, external: external, repo: repo, binding: binding}
+  end
+
+  defp finalize_binding(nil), do: nil
+
+  defp finalize_binding(%Binding{} = binding) do
+    resolved_nodes =
+      Map.new(binding.nodes || %{}, fn {name, node_config} when is_map(node_config) ->
+        resolved_token = resolve_secret_setting(Map.get(node_config, "token"), nil)
+        {name, Map.put(node_config, "token", resolved_token)}
+      end)
+
+    %{binding | nodes: resolved_nodes}
   end
 
   defp normalize_keys(value) when is_map(value) do
