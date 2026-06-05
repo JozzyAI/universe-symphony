@@ -174,6 +174,24 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Repo do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:url, :string)
+      field(:branch_prefix, :string)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:url, :branch_prefix], empty_values: [])
+    end
+  end
+
   defmodule Codex do
     @moduledoc false
     use Ecto.Schema
@@ -294,6 +312,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:external, External, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:repo, Repo, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -387,9 +406,33 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:external, with: &External.changeset/2)
+    |> cast_embed(:repo, with: &Repo.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> validate_vibe_repo_config()
+  end
+
+  defp validate_vibe_repo_config(changeset) do
+    agent_kind = get_field(changeset, :agent_kind)
+
+    repo_url =
+      case get_field(changeset, :repo) do
+        %{url: url} -> url
+        _ -> nil
+      end
+
+    after_create =
+      case get_field(changeset, :hooks) do
+        %{after_create: ac} -> ac
+        _ -> nil
+      end
+
+    if agent_kind == "vibe" and is_nil(repo_url) and is_nil(after_create) do
+      add_error(changeset, :repo, "url required when agent_kind is vibe (or configure hooks.after_create for legacy behavior)")
+    else
+      changeset
+    end
   end
 
   defp finalize_settings(settings) do
@@ -410,7 +453,17 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    external = %{
+      settings.external
+      | token: resolve_secret_setting(settings.external.token, nil)
+    }
+
+    repo = %{
+      settings.repo
+      | url: resolve_url_setting(settings.repo.url)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, external: external, repo: repo}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -505,6 +558,16 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp normalize_secret_value(_value), do: nil
+
+  defp resolve_url_setting(nil), do: nil
+
+  defp resolve_url_setting(value) when is_binary(value) do
+    case resolve_env_value(value, nil) do
+      nil -> nil
+      "" -> nil
+      url -> url
+    end
+  end
 
   defp default_turn_sandbox_policy(workspace) do
     %{

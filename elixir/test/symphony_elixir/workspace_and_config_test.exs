@@ -40,6 +40,196 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "repo.url clones repository and sets git remote on new workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-repo-clone-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(source_repo)
+      System.cmd("git", ["-C", source_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "t@t.com"])
+      File.write!(Path.join(source_repo, "README.md"), "hello\n")
+      System.cmd("git", ["-C", source_repo, "add", "."])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "init"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_kind: "vibe",
+        repo_url: source_repo
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("REPO-1")
+      assert File.exists?(Path.join(workspace, ".git"))
+      assert File.read!(Path.join(workspace, "README.md")) == "hello\n"
+
+      {origin_url, 0} = System.cmd("git", ["-C", workspace, "remote", "get-url", "origin"])
+      assert String.trim(origin_url) == source_repo
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repo.url creates branch named <branch_prefix>/<issue_id> when prefix is configured" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-repo-branch-prefix-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(source_repo)
+      System.cmd("git", ["-C", source_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "t@t.com"])
+      File.write!(Path.join(source_repo, "README.md"), "hi\n")
+      System.cmd("git", ["-C", source_repo, "add", "."])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "init"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_kind: "vibe",
+        repo_url: source_repo,
+        repo_branch_prefix: "linear"
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("REPO-2")
+
+      {branch, 0} = System.cmd("git", ["-C", workspace, "branch", "--show-current"])
+      assert String.trim(branch) == "linear/REPO-2"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repo.url creates branch named after issue_id when no prefix is configured" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-repo-branch-nopfx-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(source_repo)
+      System.cmd("git", ["-C", source_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "t@t.com"])
+      File.write!(Path.join(source_repo, "README.md"), "hi\n")
+      System.cmd("git", ["-C", source_repo, "add", "."])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "init"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_kind: "vibe",
+        repo_url: source_repo
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("REPO-3")
+
+      {branch, 0} = System.cmd("git", ["-C", workspace, "branch", "--show-current"])
+      assert String.trim(branch) == "REPO-3"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repo.url fails fast when existing workspace has no git remote" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-repo-no-remote-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(source_repo)
+      System.cmd("git", ["-C", source_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "t@t.com"])
+      File.write!(Path.join(source_repo, "README.md"), "hi\n")
+      System.cmd("git", ["-C", source_repo, "add", "."])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "init"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_kind: "vibe",
+        repo_url: source_repo
+      )
+
+      stale_workspace = Path.join(workspace_root, "REPO-4")
+      File.mkdir_p!(stale_workspace)
+      File.write!(Path.join(stale_workspace, "local.txt"), "untracked work\n")
+
+      assert {:error, {:workspace_missing_git_remote, _}} = Workspace.create_for_issue("REPO-4")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "schema validation returns error when agent_kind is vibe and neither repo.url nor hooks.after_create is set" do
+    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "vibe")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "repo"
+    assert message =~ "vibe"
+  end
+
+  test "schema allows agent_kind vibe with hooks.after_create and no repo.url" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_kind: "vibe",
+      hook_after_create: "git clone --depth 1 file:///some/repo ."
+    )
+
+    assert :ok = Config.validate!()
+  end
+
+  test "repo.url runs after_create hook after clone when both are configured" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-repo-plus-hook-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(source_repo)
+      System.cmd("git", ["-C", source_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "t@t.com"])
+      File.write!(Path.join(source_repo, "README.md"), "hi\n")
+      System.cmd("git", ["-C", source_repo, "add", "."])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "init"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_kind: "vibe",
+        repo_url: source_repo,
+        hook_after_create: "echo hook_ran > hook.log"
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("REPO-5")
+      assert File.exists?(Path.join(workspace, ".git"))
+      assert File.read!(Path.join(workspace, "hook.log")) =~ "hook_ran"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(

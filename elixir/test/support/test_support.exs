@@ -108,6 +108,8 @@ defmodule SymphonyElixir.TestSupport do
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
           agent_kind: "codex",
+          repo_url: nil,
+          repo_branch_prefix: nil,
           codex_command: "codex app-server",
           external_command: "vibe",
           external_agent: "mock",
@@ -148,6 +150,8 @@ defmodule SymphonyElixir.TestSupport do
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     agent_kind = Keyword.get(config, :agent_kind)
+    repo_url = Keyword.get(config, :repo_url)
+    repo_branch_prefix = Keyword.get(config, :repo_branch_prefix)
     external_command = Keyword.get(config, :external_command)
     external_agent = Keyword.get(config, :external_agent)
     codex_command = Keyword.get(config, :codex_command)
@@ -191,6 +195,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "agent_kind: #{yaml_value(agent_kind)}",
+        repo_yaml(repo_url, repo_branch_prefix),
         "external:",
         "  command: #{yaml_value(external_command)}",
         "  agent: #{yaml_value(external_agent)}",
@@ -234,6 +239,18 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value), do: yaml_value(to_string(value))
+
+  defp repo_yaml(nil, _branch_prefix), do: nil
+
+  defp repo_yaml(url, branch_prefix) do
+    [
+      "repo:",
+      "  url: #{yaml_value(url)}",
+      branch_prefix && "  branch_prefix: #{yaml_value(branch_prefix)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
 
   defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
 
