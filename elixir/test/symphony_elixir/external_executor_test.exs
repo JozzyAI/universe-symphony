@@ -418,7 +418,11 @@ defmodule SymphonyElixir.ExternalExecutorTest do
   end
 
   test "agent_kind reads vibe from workflow file" do
-    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "vibe")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_kind: "vibe",
+      repo_url: "https://github.com/example/repo"
+    )
+
     assert Config.settings!().agent_kind == "vibe"
   end
 

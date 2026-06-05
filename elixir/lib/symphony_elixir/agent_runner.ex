@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.{AppServer, ExternalExecutor}
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Binding, Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -29,20 +29,36 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with {:ok, workspace_opts, dispatch_opts} <- resolve_dispatch_opts(issue),
+         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host, workspace_opts) do
+      send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+      try do
+        with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          run_codex_turns(workspace, issue, codex_update_recipient, Keyword.merge(opts, dispatch_opts), worker_host)
         end
+      after
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+      end
+    end
+  end
 
-      {:error, reason} ->
-        {:error, reason}
+  defp resolve_dispatch_opts(issue) do
+    config = Config.settings!()
+
+    if config.agent_kind == "vibe" do
+      case Binding.resolve(issue, config) do
+        {:ok, binding} ->
+          workspace_opts = [repo_url: binding.repo_url, repo_branch_prefix: binding.repo_branch_prefix]
+          dispatch_opts = [resolved_binding: binding]
+          {:ok, workspace_opts, dispatch_opts}
+
+        {:error, reason} ->
+          Logger.error("Binding resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
+          {:error, {:binding_resolution_failed, reason}}
+      end
+    else
+      {:ok, [], []}
     end
   end
 
@@ -80,17 +96,18 @@ defmodule SymphonyElixir.AgentRunner do
     config = Config.settings!()
 
     if config.agent_kind == "vibe" do
+      binding = Keyword.fetch!(opts, :resolved_binding)
       prompt = build_turn_prompt(issue, opts, 1, 1)
       on_message = codex_message_handler(codex_update_recipient, issue)
 
       ExternalExecutor.run(issue, prompt, workspace,
         command: config.external.command,
-        agent: config.external.agent,
-        node: config.external.node,
-        relay: config.external.relay,
-        token: config.external.token,
-        encrypt: config.external.encrypt,
-        permission_mode: config.external.permission_mode,
+        agent: binding.agent,
+        node: binding.node_id,
+        relay: binding.relay,
+        token: binding.token,
+        encrypt: binding.encrypt,
+        permission_mode: binding.permission_mode,
         on_message: on_message
       )
     else
