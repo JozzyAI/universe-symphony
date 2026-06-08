@@ -48,10 +48,17 @@ defmodule SymphonyElixir.AgentRunner do
 
     if config.agent_kind == "vibe" do
       case Binding.resolve(issue, config) do
-        {:ok, binding} ->
+        {:ok, %{repo_url: repo_url} = binding} when is_binary(repo_url) and repo_url != "" ->
           workspace_opts = [repo_url: binding.repo_url, repo_branch_prefix: binding.repo_branch_prefix]
           dispatch_opts = [resolved_binding: binding]
           {:ok, workspace_opts, dispatch_opts}
+
+        {:ok, binding} ->
+          Logger.error(
+            "Binding resolved without repo_url for #{issue_context(issue)}: #{inspect(binding)}"
+          )
+
+          {:error, {:missing_repo_url, binding}}
 
         {:error, reason} ->
           Logger.error("Binding resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
@@ -107,6 +114,7 @@ defmodule SymphonyElixir.AgentRunner do
         relay: binding.relay,
         token: binding.token,
         encrypt: binding.encrypt,
+        repo_url: binding.repo_url,
         permission_mode: binding.permission_mode,
         on_message: on_message
       )

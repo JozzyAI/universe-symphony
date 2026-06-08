@@ -46,12 +46,13 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     relay = Keyword.get(opts, :relay)
     token = Keyword.get(opts, :token)
     encrypt = Keyword.get(opts, :encrypt)
+    repo_url = Keyword.get(opts, :repo_url)
     permission_mode = Keyword.get(opts, :permission_mode)
 
     prompt_file = write_temp_prompt!(prompt, issue)
 
     try do
-      with {:ok, run_meta} <- start_run(command, agent, issue, prompt_file, node, relay, token, encrypt, permission_mode) do
+      with {:ok, run_meta} <- start_run(command, agent, issue, prompt_file, node, relay, token, encrypt, repo_url, permission_mode) do
         # Announce Vibe run metadata so the orchestrator can display run_id/node/agent in the UI.
         on_message.(%{
           event: :vibe_start,
@@ -70,7 +71,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
 
   # ── Internal ───────────────────────────────────────────────────────────────
 
-  defp start_run(command, agent, issue, prompt_file, node, relay, token, encrypt, permission_mode) do
+  defp start_run(command, agent, issue, prompt_file, node, relay, token, encrypt, repo_url, permission_mode) do
     args =
       [
         "symphony", "start",
@@ -83,6 +84,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
       ]
       |> append_relay_args(node, relay, token)
       |> append_encrypt(encrypt, relay)
+      |> append_repo_url(repo_url)
       |> append_permission_mode(permission_mode)
 
     Logger.info("ExternalExecutor: #{command} symphony start issue_id=#{issue.id} node=#{inspect(node)} relay=#{inspect(relay)}")
@@ -321,6 +323,12 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   # Encrypting local runs has no effect (no relay to be blind to the payload).
   defp append_encrypt(args, true, relay) when is_binary(relay), do: args ++ ["--encrypt"]
   defp append_encrypt(args, _encrypt, _relay), do: args
+
+  defp append_repo_url(args, repo_url) when is_binary(repo_url) and repo_url != "" do
+    args ++ ["--repo-url", repo_url]
+  end
+
+  defp append_repo_url(args, _repo_url), do: args
 
   defp append_permission_mode(args, mode) when is_binary(mode) and mode != "default" do
     args ++ ["--permission-mode", mode]
