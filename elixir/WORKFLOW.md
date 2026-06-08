@@ -31,11 +31,11 @@ binding:
     company-node:
       relay: wss://vibe-relay.dynastylab.ai
       token: $VIBE_RELAY_TOKEN
-      # TODO: node_id is host-specific (regenerated per `~/.vibe/identity.json`,
-      # i.e. per machine/WSL session) and is not resolved from env vars like
-      # `token` is. Until `Config.Schema.finalize_binding` supports `$ENV_VAR`
-      # for `node_id`, this value must be kept in sync with the active relay
-      # node's identity by hand. Current value matches the dev laptop node.
+      # node_id is host-specific (regenerated per `~/.vibe/identity.json`,
+      # i.e. per machine/WSL session). The value below matches the dev laptop
+      # node. To dispatch from a different machine without editing this file,
+      # export SYMPHONY_NODE_ID=<that machine's node_id> — Binding.resolve
+      # honors it as: SYMPHONY_NODE_ID > binding.node_id > fail fast.
       node_id: node_46429f063508bae4
       allowed_agents:
         - mock

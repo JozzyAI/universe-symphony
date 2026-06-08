@@ -140,8 +140,9 @@ defmodule SymphonyElixir.Binding do
 
     with {:ok, repo_url} <- resolve_repo(raw_repo, allowed_orgs),
          {:ok, node_name} <- resolve_node(raw_node, nodes),
-         {:ok, agent_name} <- resolve_agent(raw_agent, node_name, nodes, agents) do
-      node_config = Map.get(nodes, node_name, %{})
+         {:ok, agent_name} <- resolve_agent(raw_agent, node_name, nodes, agents),
+         node_config = Map.get(nodes, node_name, %{}),
+         {:ok, node_id} <- resolve_node_id(Map.get(node_config, "node_id"), node_name) do
       agent_config = Map.get(agents, agent_name, %{})
 
       {:ok,
@@ -149,7 +150,7 @@ defmodule SymphonyElixir.Binding do
          repo_url: repo_url,
          repo_branch_prefix: struct_get(defaults, :repo_branch_prefix),
          node: node_name,
-         node_id: Map.get(node_config, "node_id") || node_name,
+         node_id: node_id,
          relay: Map.get(node_config, "relay"),
          token: Map.get(node_config, "token"),
          encrypt: struct_get(defaults, :encrypt) == true,
@@ -164,18 +165,48 @@ defmodule SymphonyElixir.Binding do
   # ---------------------------------------------------------------------------
 
   defp do_resolve_legacy(settings) do
-    {:ok,
-     %{
-       repo_url: settings.repo.url,
-       repo_branch_prefix: settings.repo.branch_prefix,
-       node: settings.external.node,
-       node_id: settings.external.node,
-       relay: settings.external.relay,
-       token: settings.external.token,
-       encrypt: settings.external.encrypt == true,
-       agent: settings.external.agent,
-       permission_mode: settings.external.permission_mode
-     }}
+    with {:ok, node_id} <- resolve_node_id(settings.external.node, settings.external.node) do
+      {:ok,
+       %{
+         repo_url: settings.repo.url,
+         repo_branch_prefix: settings.repo.branch_prefix,
+         node: settings.external.node,
+         node_id: node_id,
+         relay: settings.external.relay,
+         token: settings.external.token,
+         encrypt: settings.external.encrypt == true,
+         agent: settings.external.agent,
+         permission_mode: settings.external.permission_mode
+       }}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: node_id resolution (env override > configured value > fail fast)
+  # ---------------------------------------------------------------------------
+
+  # `SYMPHONY_NODE_ID` lets an operator point dispatch at a different relay
+  # node identity (e.g. switching laptops/machines) without editing the
+  # binding's `node_id` in WORKFLOW.md, which is host-specific and regenerated
+  # per `~/.vibe/identity.json`.
+  defp resolve_node_id(configured_node_id, context) do
+    case node_id_override() do
+      {:ok, override} ->
+        {:ok, override}
+
+      :not_set ->
+        case configured_node_id do
+          id when is_binary(id) and id != "" -> {:ok, id}
+          _ -> {:error, {:missing_node_id, context}}
+        end
+    end
+  end
+
+  defp node_id_override do
+    case System.get_env("SYMPHONY_NODE_ID") do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> :not_set
+    end
   end
 
   # ---------------------------------------------------------------------------
