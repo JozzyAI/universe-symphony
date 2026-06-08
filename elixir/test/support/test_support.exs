@@ -121,6 +121,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_command: "codex app-server",
           external_command: "vibe",
           external_agent: "mock",
+          external_node: "node_test_legacy",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
@@ -163,6 +164,7 @@ defmodule SymphonyElixir.TestSupport do
     binding = Keyword.get(config, :binding)
     external_command = Keyword.get(config, :external_command)
     external_agent = Keyword.get(config, :external_agent)
+    external_node = Keyword.get(config, :external_node)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -209,6 +211,7 @@ defmodule SymphonyElixir.TestSupport do
         "external:",
         "  command: #{yaml_value(external_command)}",
         "  agent: #{yaml_value(external_agent)}",
+        "  node: #{yaml_value(external_node)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

@@ -46,6 +46,7 @@ defmodule SymphonyElixir.BindingTest do
       |> Enum.map_join("\n", fn {name, cfg} ->
         relay = Map.get(cfg, :relay, "wss://relay.example.com")
         token = Map.get(cfg, :token, "tok")
+        node_id = Map.get(cfg, :node_id, "node_test_#{name}")
         agents = Map.get(cfg, :allowed_agents, ["mock", "claude-code"])
 
         agents_yaml = Enum.map_join(agents, "\n", &"        - #{&1}")
@@ -54,6 +55,7 @@ defmodule SymphonyElixir.BindingTest do
             #{name}:
               relay: "#{relay}"
               token: "#{token}"
+              node_id: "#{node_id}"
               allowed_agents:
         #{agents_yaml}
         """
@@ -253,6 +255,133 @@ defmodule SymphonyElixir.BindingTest do
       {:ok, resolved} = Binding.resolve(issue(labels: []), settings)
       assert resolved.relay == "wss://vibe-relay.example.com"
       assert resolved.token == "tok"
+    end
+  end
+
+  describe "resolve/2 — node_id resolution (SYMPHONY_NODE_ID > binding.node_id > fail fast)" do
+    setup do
+      previous = System.get_env("SYMPHONY_NODE_ID")
+      on_exit(fn -> restore_env("SYMPHONY_NODE_ID", previous) end)
+      :ok
+    end
+
+    test "uses the node's configured node_id when no override is set" do
+      System.delete_env("SYMPHONY_NODE_ID")
+
+      nodes = %{
+        "company-node" => %{
+          relay: "wss://r.example.com",
+          token: "t",
+          node_id: "node_company_abc123",
+          allowed_agents: ["mock", "claude-code"]
+        }
+      }
+
+      settings = settings_with_binding(%{nodes: nodes})
+      {:ok, resolved} = Binding.resolve(issue(labels: ["node:company-node"]), settings)
+
+      assert resolved.node_id == "node_company_abc123"
+    end
+
+    test "SYMPHONY_NODE_ID overrides the configured node_id" do
+      System.put_env("SYMPHONY_NODE_ID", "node_override_xyz789")
+
+      nodes = %{
+        "company-node" => %{
+          relay: "wss://r.example.com",
+          token: "t",
+          node_id: "node_company_abc123",
+          allowed_agents: ["mock", "claude-code"]
+        }
+      }
+
+      settings = settings_with_binding(%{nodes: nodes})
+      {:ok, resolved} = Binding.resolve(issue(labels: ["node:company-node"]), settings)
+
+      assert resolved.node_id == "node_override_xyz789"
+    end
+
+    test "SYMPHONY_NODE_ID lets resolution succeed when the node has no configured node_id" do
+      System.put_env("SYMPHONY_NODE_ID", "node_override_xyz789")
+
+      nodes_yaml = """
+          company-node:
+            relay: "wss://r.example.com"
+            token: "t"
+            allowed_agents:
+              - mock
+              - claude-code
+      """
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        agent_kind: "vibe",
+        binding: """
+        binding:
+          repo_policy:
+            allowed_github_orgs:
+              - JozzyAI
+          nodes:
+        #{nodes_yaml}
+          agents:
+            mock:
+              permission_mode: "default"
+            claude-code:
+              permission_mode: "unsafe-skip"
+          defaults:
+            repo: "https://github.com/JozzyAI/fin_bot"
+            node: "company-node"
+            agent: "claude-code"
+            encrypt: true
+        """
+      )
+
+      {:ok, %{config: config}} = Workflow.load()
+      {:ok, settings} = SymphonyElixir.Config.Schema.parse(config)
+
+      {:ok, resolved} = Binding.resolve(issue(labels: ["node:company-node"]), settings)
+
+      assert resolved.node_id == "node_override_xyz789"
+    end
+
+    test "fails fast when node has no configured node_id and no override is set" do
+      System.delete_env("SYMPHONY_NODE_ID")
+
+      nodes_yaml = """
+          company-node:
+            relay: "wss://r.example.com"
+            token: "t"
+            allowed_agents:
+              - mock
+              - claude-code
+      """
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        agent_kind: "vibe",
+        binding: """
+        binding:
+          repo_policy:
+            allowed_github_orgs:
+              - JozzyAI
+          nodes:
+        #{nodes_yaml}
+          agents:
+            mock:
+              permission_mode: "default"
+            claude-code:
+              permission_mode: "unsafe-skip"
+          defaults:
+            repo: "https://github.com/JozzyAI/fin_bot"
+            node: "company-node"
+            agent: "claude-code"
+            encrypt: true
+        """
+      )
+
+      {:ok, %{config: config}} = Workflow.load()
+      {:ok, settings} = SymphonyElixir.Config.Schema.parse(config)
+
+      assert {:error, {:missing_node_id, "company-node"}} =
+               Binding.resolve(issue(labels: ["node:company-node"]), settings)
     end
   end
 
