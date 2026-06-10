@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Linear.Client do
   @max_error_body_log_bytes 1_000
 
   @query """
-  query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+  query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $after: String) {
     issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
       nodes {
         id
@@ -38,18 +38,6 @@ defmodule SymphonyElixir.Linear.Client do
             }
           }
         }
-        inverseRelations(first: $relationFirst) {
-          nodes {
-            type
-            issue {
-              id
-              identifier
-              state {
-                name
-              }
-            }
-          }
-        }
         createdAt
         updatedAt
       }
@@ -62,7 +50,7 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   @query_by_ids """
-  query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!) {
+  query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!) {
     issues(filter: {id: {in: $ids}}, first: $first) {
       nodes {
         id
@@ -87,18 +75,6 @@ defmodule SymphonyElixir.Linear.Client do
           labels {
             nodes {
               name
-            }
-          }
-        }
-        inverseRelations(first: $relationFirst) {
-          nodes {
-            type
-            issue {
-              id
-              identifier
-              state {
-                name
-              }
             }
           }
         }
@@ -260,7 +236,6 @@ defmodule SymphonyElixir.Linear.Client do
              projectSlug: project_slug,
              stateNames: state_names,
              first: @issue_page_size,
-             relationFirst: @issue_page_size,
              after: after_cursor
            }),
          {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
@@ -307,8 +282,7 @@ defmodule SymphonyElixir.Linear.Client do
 
     case graphql_fun.(@query_by_ids, %{
            ids: batch_ids,
-           first: length(batch_ids),
-           relationFirst: @issue_page_size
+           first: length(batch_ids)
          }) do
       {:ok, body} ->
         with {:ok, issues} <- decode_linear_response(body, assignee_filter) do
