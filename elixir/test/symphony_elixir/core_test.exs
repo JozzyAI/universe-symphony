@@ -17,6 +17,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_continuation_attempts == 1
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -36,6 +37,13 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_continuation_attempts: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_continuation_attempts"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_continuation_attempts: 3)
+    assert Config.settings!().agent.max_continuation_attempts == 3
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -566,6 +574,134 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "todo issue is moved to In Progress before dispatch (Symphony-owned, agent-agnostic)" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    todo_issue = %Issue{id: "issue-todo", identifier: "MT-600", state: "Todo", labels: []}
+
+    assert %Issue{state: "In Progress"} =
+             Orchestrator.maybe_advance_todo_to_in_progress_for_test(todo_issue)
+
+    assert_receive {:memory_tracker_state_update, "issue-todo", "In Progress"}
+  end
+
+  test "issue already in an active state is dispatched without a Linear transition" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    in_progress_issue = %Issue{id: "issue-in-progress", identifier: "MT-601", state: "In Progress", labels: []}
+
+    assert %Issue{state: "In Progress"} =
+             Orchestrator.maybe_advance_todo_to_in_progress_for_test(in_progress_issue)
+
+    refute_receive {:memory_tracker_state_update, _issue_id, _state_name}
+  end
+
+  test "normal worker exit with a PR moves the issue to Human Review and stops retries (mock agent)" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-pr-ready"
+    pr_url = "https://github.com/JozzyAI/fin_bot/pull/42"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :PrReadyOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-570",
+      vibe_agent: "mock",
+      vibe_pr_url: pr_url,
+      issue: %Issue{id: issue_id, identifier: "MT-570", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment}
+    assert comment =~ pr_url
+
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  test "second normal exit without a PR stalls and moves the issue to Human Review (claude-code agent)" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-stall"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :StallOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-571",
+      vibe_agent: "claude-code",
+      retry_attempt: 1,
+      issue: %Issue{id: issue_id, identifier: "MT-571", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment}
+    assert comment =~ "without a pull request"
+    assert comment =~ "Human Review"
+
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
+
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
@@ -975,12 +1111,22 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Current status: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
     assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
     assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
+
+    # P1/P4: codex/claude-code/mock are coding-only — Symphony owns Linear state
+    # transitions and comments based on git/PR activity, not the agent itself.
+    assert prompt =~ "Symphony manages Linear status and"
+    assert prompt =~ "comments based on your git/PR activity"
+    # Linear MCP is optional read-only reference, never a requirement or blocker.
+    assert prompt =~ "Linear MCP server or tool happens to be available"
+    assert prompt =~ "it is never required, and you must not stop or"
+
+    refute prompt =~ "linear_graphql"
+    refute prompt =~ "Codex Workpad"
+    refute prompt =~ "update_issue"
+    refute prompt =~ "gh pr merge"
   end
 
   test "prompt builder adds continuation guidance for retries" do

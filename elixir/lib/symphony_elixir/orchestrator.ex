@@ -198,19 +198,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    cond do
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      pr_url = Map.get(running_entry, :vibe_pr_url) ->
+        Logger.info("Agent task completed with PR for issue_id=#{issue_id} session_id=#{session_id} pr_url=#{pr_url}")
+
+        finish_issue_with_pr(state, issue_id, running_entry, pr_url)
+
+      continuation_attempts_exhausted?(running_entry) ->
+        Logger.warning("Agent task completed without a PR for issue_id=#{issue_id} session_id=#{session_id} after exhausting continuation attempts")
+
+        finish_issue_as_stalled(state, issue_id, running_entry)
+
+      true ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling bounded continuation check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, next_continuation_attempt(running_entry), %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
     end
   end
 
@@ -380,6 +393,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec maybe_advance_todo_to_in_progress_for_test(Issue.t()) :: Issue.t()
+  def maybe_advance_todo_to_in_progress_for_test(%Issue{} = issue) do
+    maybe_advance_todo_to_in_progress(issue)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -925,9 +944,36 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
+        issue = maybe_advance_todo_to_in_progress(issue)
         spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
     end
   end
+
+  # Symphony owns Linear state transitions; executor agents only write code/PRs.
+  # Best-effort: on failure, log and dispatch anyway with the original state.
+  #
+  # Only Todo is advanced here. Rework/Merging issues are dispatched as-is: a Rework
+  # dispatch is just a PR-feedback pass under the same WORKFLOW.md, and a Merging
+  # dispatch that produces no PR falls through to the bounded continuation/stall path
+  # in handle_agent_down/5 like any other no-PR exit. Symphony does not yet act on
+  # `Merging` itself (e.g. auto-merge) — that remains future work.
+  defp maybe_advance_todo_to_in_progress(%Issue{id: id, state: state_name} = issue)
+       when is_binary(id) do
+    if normalize_issue_state(state_name) == "todo" do
+      case Tracker.update_issue_state(id, "In Progress") do
+        :ok ->
+          %{issue | state: "In Progress"}
+
+        {:error, reason} ->
+          Logger.warning("Failed to move #{issue_context(issue)} to In Progress: #{inspect(reason)}")
+          issue
+      end
+    else
+      issue
+    end
+  end
+
+  defp maybe_advance_todo_to_in_progress(issue), do: issue
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
@@ -1008,6 +1054,54 @@ defmodule SymphonyElixir.Orchestrator do
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
+
+  defp next_continuation_attempt(running_entry) do
+    (Map.get(running_entry, :retry_attempt) || 0) + 1
+  end
+
+  defp continuation_attempts_exhausted?(running_entry) do
+    next_continuation_attempt(running_entry) > Config.settings!().agent.max_continuation_attempts
+  end
+
+  # Symphony-owned post-run Linear handling: the executor agent only writes code/PRs;
+  # Symphony comments and transitions the issue based on the run outcome. Either Linear
+  # call may fail independently — both are best-effort and never trigger a retry, so a
+  # Linear outage cannot reproduce a dispatch loop.
+  defp finish_issue_with_pr(%State{} = state, issue_id, running_entry, pr_url) do
+    notify_issue_outcome(running_entry.issue, "Symphony: PR ready for review — #{pr_url}", "Human Review")
+
+    state
+    |> complete_issue(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
+  defp finish_issue_as_stalled(%State{} = state, issue_id, running_entry) do
+    attempts = Map.get(running_entry, :retry_attempt, 0) + 1
+
+    notify_issue_outcome(
+      running_entry.issue,
+      "Symphony: agent run completed without a pull request after #{attempts} attempt(s). Pausing automatic retries — moved to Human Review for manual follow-up.",
+      "Human Review"
+    )
+
+    state
+    |> complete_issue(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
+  defp notify_issue_outcome(%Issue{id: id} = issue, comment, target_state) when is_binary(id) do
+    case Tracker.create_comment(id, comment) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("Failed to comment on #{issue_context(issue)}: #{inspect(reason)}")
+    end
+
+    case Tracker.update_issue_state(id, target_state) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("Failed to move #{issue_context(issue)} to #{target_state}: #{inspect(reason)}")
+    end
+  end
+
+  defp notify_issue_outcome(_issue, _comment, _target_state), do: :ok
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
@@ -1534,6 +1628,9 @@ defmodule SymphonyElixir.Orchestrator do
             vibe_approval_id: Map.get(update, :approval_id),
             vibe_approval_message: Map.get(update, :message)
           }
+
+        event == :pr_created ->
+          %{vibe_pr_url: Map.get(update, :url)}
 
         true ->
           %{}
