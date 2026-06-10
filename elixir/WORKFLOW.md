@@ -40,12 +40,16 @@ binding:
       allowed_agents:
         - mock
         - claude-code
+        - codex
 
   agents:
     mock:
       permission_mode: default
 
     claude-code:
+      permission_mode: unsafe-skip
+
+    codex:
       permission_mode: unsafe-skip
 
   defaults:
