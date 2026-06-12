@@ -23,19 +23,41 @@ agent_kind: vibe
 external:
   command: vibe
 binding:
+  # Label-based dispatch routing (optional). An issue's `agent:*`, `repo:*`,
+  # and `node:*` labels (or its project's labels) override `defaults` below;
+  # an issue with none of these labels uses `defaults` exactly as configured
+  # here. See elixir/docs/label-routing.md for the full label reference,
+  # including what happens when a label is duplicated or unrecognized.
   repo_policy:
     allowed_github_orgs:
       - JozzyAI
+    allowed_repos:
+      - fin_bot
+      - vibe_interface_cli
+      - universe-symphony
 
   nodes:
-    company-node:
+    joey-pc:
       relay: wss://vibe-relay.dynastylab.ai
       token: $VIBE_RELAY_TOKEN
       # node_id is host-specific (regenerated per `~/.vibe/identity.json`,
-      # i.e. per machine/WSL session). The value below matches the dev laptop
-      # node. To dispatch from a different machine without editing this file,
-      # export SYMPHONY_NODE_ID=<that machine's node_id> — Binding.resolve
-      # honors it as: SYMPHONY_NODE_ID > binding.node_id > fail fast.
+      # i.e. per machine/WSL session). The value below is this dev laptop's
+      # current node_id. To dispatch from a different machine without editing
+      # this file, export SYMPHONY_NODE_ID=<that machine's node_id> —
+      # Binding.resolve honors it as: SYMPHONY_NODE_ID > binding.node_id >
+      # fail fast.
+      node_id: node_f7cedd3b6590aff9
+      allowed_agents:
+        - mock
+        - claude-code
+        - codex
+
+    company-node:
+      relay: wss://vibe-relay.dynastylab.ai
+      token: $VIBE_RELAY_TOKEN
+      # node_id from an earlier registration of this node, kept for issues
+      # already labeled `node:company-node`. Update this value (or remove
+      # the entry) if it no longer corresponds to an online node.
       node_id: node_46429f063508bae4
       allowed_agents:
         - mock
@@ -55,8 +77,8 @@ binding:
   defaults:
     repo: https://github.com/JozzyAI/fin_bot
     repo_branch_prefix: linear
-    node: company-node
-    agent: claude-code
+    node: joey-pc
+    agent: codex
     encrypt: true
 ---
 
