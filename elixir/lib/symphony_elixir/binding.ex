@@ -72,22 +72,39 @@ defmodule SymphonyElixir.Binding do
   end
 
   @doc """
-  Extract the first repo/node/agent tag from a list of label strings.
+  Extract the repo/node/agent tags from a list of label strings.
+
+  Returns the first value seen for each type, plus a `:conflicts` map
+  listing every value seen for any type with more than one match (empty
+  list when there's no conflict for that type).
   """
   @spec extract_labels([String.t()]) :: %{
           repo: String.t() | nil,
           node: String.t() | nil,
-          agent: String.t() | nil
+          agent: String.t() | nil,
+          conflicts: %{repo: [String.t()], node: [String.t()], agent: [String.t()]}
         }
   def extract_labels(labels) when is_list(labels) do
-    Enum.reduce(labels, %{repo: nil, node: nil, agent: nil}, fn label, acc ->
-      case parse_label(label) do
-        {:repo, v} when is_nil(acc.repo) -> %{acc | repo: v}
-        {:node, v} when is_nil(acc.node) -> %{acc | node: v}
-        {:agent, v} when is_nil(acc.agent) -> %{acc | agent: v}
-        _ -> acc
-      end
-    end)
+    grouped =
+      labels
+      |> Enum.map(&parse_label/1)
+      |> Enum.reduce(%{repo: [], node: [], agent: []}, fn
+        {:repo, v}, acc -> %{acc | repo: acc.repo ++ [v]}
+        {:node, v}, acc -> %{acc | node: acc.node ++ [v]}
+        {:agent, v}, acc -> %{acc | agent: acc.agent ++ [v]}
+        :unknown, acc -> acc
+      end)
+
+    %{
+      repo: List.first(grouped.repo),
+      node: List.first(grouped.node),
+      agent: List.first(grouped.agent),
+      conflicts: %{
+        repo: if(length(grouped.repo) > 1, do: grouped.repo, else: []),
+        node: if(length(grouped.node) > 1, do: grouped.node, else: []),
+        agent: if(length(grouped.agent) > 1, do: grouped.agent, else: [])
+      }
+    }
   end
 
   @doc """
@@ -110,6 +127,52 @@ defmodule SymphonyElixir.Binding do
     end
   end
 
+  @doc """
+  Render an error returned by `resolve/2` as a short, human-readable
+  sentence suitable for posting back to the Linear issue as a comment.
+  """
+  @spec describe_error(term()) :: String.t()
+  def describe_error({:conflicting_labels, type, values}) do
+    labels = Enum.map_join(values, ", ", &"#{type}:#{&1}")
+    "Found #{length(values)} conflicting `#{type}:*` labels (#{labels}) — only one `#{type}:*` label is allowed per issue."
+  end
+
+  def describe_error({:unknown_agent, name, known}) do
+    "Unknown `agent:#{name}` label — configured agents are: #{Enum.join(known, ", ")}."
+  end
+
+  def describe_error({:unknown_node, name, known}) do
+    "Unknown `node:#{name}` label — configured nodes are: #{Enum.join(known, ", ")}."
+  end
+
+  def describe_error({:unknown_repo, repo_name, raw, allowed}) do
+    "Unknown repo #{inspect(repo_name)} in `repo:#{raw}` label — configured repos are: #{Enum.join(allowed, ", ")}."
+  end
+
+  def describe_error({:agent_not_allowed_on_node, name, node_name, allowed}) do
+    "Agent `#{name}` is not allowed on node `#{node_name}` (allowed agents on that node: #{Enum.join(allowed, ", ")})."
+  end
+
+  def describe_error({:missing_binding, field, _detail}) do
+    "No `#{field}:*` label found on this issue and no default `#{field}` is configured in WORKFLOW.md."
+  end
+
+  def describe_error({:invalid_repo_label, message}) do
+    "Invalid `repo:*` label: #{message}."
+  end
+
+  def describe_error({:missing_node_id, node_name}) do
+    "Node `#{node_name}` has no configured `node_id` and SYMPHONY_NODE_ID is not set."
+  end
+
+  def describe_error({:missing_repo_url, _binding}) do
+    "Binding resolved without a repo_url — check `binding.defaults.repo` and `repo:*` labels in WORKFLOW.md."
+  end
+
+  def describe_error(reason) do
+    "Binding resolution failed: #{inspect(reason)}."
+  end
+
   # ---------------------------------------------------------------------------
   # Private: binding-based resolution
   # ---------------------------------------------------------------------------
@@ -129,16 +192,21 @@ defmodule SymphonyElixir.Binding do
     raw_node = issue_extracted.node || project_extracted.node || struct_get(defaults, :node)
     raw_agent = issue_extracted.agent || project_extracted.agent || struct_get(defaults, :agent)
 
-    allowed_orgs =
+    {allowed_orgs, allowed_repos} =
       case binding.repo_policy do
-        nil -> []
-        policy -> struct_get(policy, :allowed_github_orgs) || []
+        nil ->
+          {[], []}
+
+        policy ->
+          {struct_get(policy, :allowed_github_orgs) || [], struct_get(policy, :allowed_repos) || []}
       end
 
     nodes = binding.nodes || %{}
     agents = binding.agents || %{}
 
-    with {:ok, repo_url} <- resolve_repo(raw_repo, allowed_orgs),
+    with :ok <- check_no_conflicts(issue_extracted.conflicts),
+         :ok <- check_no_conflicts(project_extracted.conflicts),
+         {:ok, repo_url} <- resolve_repo(raw_repo, allowed_orgs, allowed_repos),
          {:ok, node_name} <- resolve_node(raw_node, nodes),
          {:ok, agent_name} <- resolve_agent(raw_agent, node_name, nodes, agents),
          node_config = Map.get(nodes, node_name, %{}),
@@ -159,6 +227,14 @@ defmodule SymphonyElixir.Binding do
        }}
     end
   end
+
+  # A list of two or more `agent:*`/`repo:*`/`node:*` labels of the same type
+  # on one issue (or one project) is a misconfiguration — resolving "the
+  # first one" would silently ignore the conflict, so fail fast instead.
+  defp check_no_conflicts(%{repo: [], node: [], agent: []}), do: :ok
+  defp check_no_conflicts(%{repo: repo}) when repo != [], do: {:error, {:conflicting_labels, :repo, repo}}
+  defp check_no_conflicts(%{node: node}) when node != [], do: {:error, {:conflicting_labels, :node, node}}
+  defp check_no_conflicts(%{agent: agent}) when agent != [], do: {:error, {:conflicting_labels, :agent, agent}}
 
   # ---------------------------------------------------------------------------
   # Private: legacy resolution (external: + repo: config)
@@ -213,10 +289,10 @@ defmodule SymphonyElixir.Binding do
   # Private: repo resolution and validation
   # ---------------------------------------------------------------------------
 
-  defp resolve_repo(nil, _allowed_orgs), do: {:ok, nil}
-  defp resolve_repo("", _allowed_orgs), do: {:error, {:invalid_repo_label, "empty repo value"}}
+  defp resolve_repo(nil, _allowed_orgs, _allowed_repos), do: {:ok, nil}
+  defp resolve_repo("", _allowed_orgs, _allowed_repos), do: {:error, {:invalid_repo_label, "empty repo value"}}
 
-  defp resolve_repo(raw, allowed_orgs) do
+  defp resolve_repo(raw, allowed_orgs, allowed_repos) do
     cond do
       String.contains?(raw, "..") ->
         {:error, {:invalid_repo_label, "path traversal not allowed in repo"}}
@@ -237,25 +313,27 @@ defmodule SymphonyElixir.Binding do
         {:error, {:invalid_repo_label, "http:// not allowed — use https://github.com/"}}
 
       String.starts_with?(raw, "https://github.com/") ->
-        validate_github_url(raw, allowed_orgs)
+        validate_github_url(raw, allowed_orgs, allowed_repos)
 
       String.starts_with?(raw, "https://") ->
         {:error, {:invalid_repo_label, "only github.com repos are allowed: #{inspect(raw)}"}}
 
       Regex.match?(~r{^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$}, raw) ->
         # org/repo shorthand
-        [org, _repo] = String.split(raw, "/", parts: 2)
+        [org, repo_name] = String.split(raw, "/", parts: 2)
 
-        case validate_github_org(org, raw, allowed_orgs) do
-          :ok -> {:ok, "https://github.com/#{raw}"}
-          err -> err
+        with :ok <- validate_github_org(org, raw, allowed_orgs),
+             :ok <- validate_allowed_repo(repo_name, raw, allowed_repos) do
+          {:ok, "https://github.com/#{raw}"}
         end
 
       Regex.match?(~r{^[A-Za-z0-9_.-]+$}, raw) ->
         # bare repo name — expand using the single allowed org
         case allowed_orgs do
           [org] ->
-            {:ok, "https://github.com/#{org}/#{raw}"}
+            with :ok <- validate_allowed_repo(raw, raw, allowed_repos) do
+              {:ok, "https://github.com/#{org}/#{raw}"}
+            end
 
           [] ->
             {:error,
@@ -273,12 +351,12 @@ defmodule SymphonyElixir.Binding do
     end
   end
 
-  defp validate_github_url(url, allowed_orgs) do
+  defp validate_github_url(url, allowed_orgs, allowed_repos) do
     case Regex.run(~r{^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)}, url) do
-      [_, org, _repo] ->
-        case validate_github_org(org, url, allowed_orgs) do
-          :ok -> {:ok, url}
-          err -> err
+      [_, org, repo_name] ->
+        with :ok <- validate_github_org(org, url, allowed_orgs),
+             :ok <- validate_allowed_repo(repo_name, url, allowed_repos) do
+          {:ok, url}
         end
 
       _ ->
@@ -296,6 +374,18 @@ defmodule SymphonyElixir.Binding do
       {:error,
        {:invalid_repo_label,
         "org #{inspect(org)} is not in allowed_github_orgs #{inspect(allowed_orgs)} (from #{inspect(raw)})"}}
+    end
+  end
+
+  # Empty allowed_repos list = no restriction (any syntactically valid repo
+  # name is accepted, as before this allowlist existed).
+  defp validate_allowed_repo(_repo_name, _raw, []), do: :ok
+
+  defp validate_allowed_repo(repo_name, raw, allowed_repos) do
+    if Enum.member?(allowed_repos, repo_name) do
+      :ok
+    else
+      {:error, {:unknown_repo, repo_name, raw, allowed_repos}}
     end
   end
 

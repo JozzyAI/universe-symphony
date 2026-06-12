@@ -235,11 +235,12 @@ defmodule SymphonyElixir.Config.Schema do
       @primary_key false
       embedded_schema do
         field(:allowed_github_orgs, {:array, :string}, default: [])
+        field(:allowed_repos, {:array, :string}, default: [])
       end
 
       @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
       def changeset(schema, attrs) do
-        schema |> cast(attrs, [:allowed_github_orgs], empty_values: [])
+        schema |> cast(attrs, [:allowed_github_orgs, :allowed_repos], empty_values: [])
       end
     end
 
