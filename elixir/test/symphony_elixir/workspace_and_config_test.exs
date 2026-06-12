@@ -4,6 +4,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.ProjectResources
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -543,6 +544,103 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.state == "Todo"
     assert issue.assignee_id == "user-1"
     assert issue.assigned_to_worker
+  end
+
+  test "linear client normalizes a single project resource link" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "MT-1",
+      "state" => %{"name" => "Todo"},
+      "project" => %{
+        "externalLinks" => %{
+          "nodes" => [
+            %{"url" => "https://github.com/JozzyAI/fin_bot", "label" => "Repo"}
+          ]
+        }
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue)
+
+    assert issue.project_resources == ["https://github.com/JozzyAI/fin_bot"]
+  end
+
+  test "linear client normalizes a project with no resource links" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "MT-1",
+      "state" => %{"name" => "Todo"},
+      "project" => %{
+        "description" => "No resources here.",
+        "externalLinks" => %{"nodes" => []}
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue)
+
+    assert issue.project_resources == []
+  end
+
+  test "linear client normalizes an issue with no project at all" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "MT-1",
+      "state" => %{"name" => "Todo"}
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue)
+
+    assert issue.project_resources == []
+  end
+
+  test "linear client preserves multiple project resource links, including non-GitHub ones" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "MT-1",
+      "state" => %{"name" => "Todo"},
+      "project" => %{
+        "externalLinks" => %{
+          "nodes" => [
+            %{"url" => "https://github.com/JozzyAI/fin_bot", "label" => "Repo"},
+            %{"url" => "https://github.com/JozzyAI/vibe_interface_cli", "label" => "Vibe repo"},
+            %{"url" => "https://www.figma.com/file/abc123/design", "label" => "Design"}
+          ]
+        }
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue)
+
+    assert issue.project_resources == [
+             "https://github.com/JozzyAI/fin_bot",
+             "https://github.com/JozzyAI/vibe_interface_cli",
+             "https://www.figma.com/file/abc123/design"
+           ]
+
+    assert ProjectResources.github_repo_urls(issue.project_resources) == [
+             "https://github.com/JozzyAI/fin_bot",
+             "https://github.com/JozzyAI/vibe_interface_cli"
+           ]
+  end
+
+  test "linear client drops a resource link missing a url" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "MT-1",
+      "state" => %{"name" => "Todo"},
+      "project" => %{
+        "externalLinks" => %{
+          "nodes" => [
+            %{"label" => "Untitled"},
+            %{"url" => "https://github.com/JozzyAI/fin_bot", "label" => "Repo"}
+          ]
+        }
+      }
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue)
+
+    assert issue.project_resources == ["https://github.com/JozzyAI/fin_bot"]
   end
 
   test "linear client marks explicitly unassigned issues as not routed to worker" do
