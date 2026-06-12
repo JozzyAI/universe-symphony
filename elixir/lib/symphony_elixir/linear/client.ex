@@ -39,6 +39,12 @@ defmodule SymphonyElixir.Linear.Client do
               name
             }
           }
+          links {
+            nodes {
+              url
+              label
+            }
+          }
         }
         inverseRelations(first: $relationFirst) {
           nodes {
@@ -91,6 +97,12 @@ defmodule SymphonyElixir.Linear.Client do
           labels {
             nodes {
               name
+            }
+          }
+          links {
+            nodes {
+              url
+              label
             }
           }
         }
@@ -480,6 +492,7 @@ defmodule SymphonyElixir.Linear.Client do
       labels: extract_labels(issue),
       project_labels: extract_project_labels(issue),
       project_description: extract_project_description(issue),
+      project_resources: extract_project_resources(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
@@ -584,6 +597,21 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_project_description(_), do: nil
+
+  # Project "Resources" (external links), as configured on the Linear
+  # project's overview page. Returned as a flat list of raw URL strings in
+  # whatever order Linear returns them; no filtering/interpretation happens
+  # here. See `SymphonyElixir.Linear.ProjectResources` for helpers that
+  # interpret these URLs (e.g. picking out GitHub repo links).
+  defp extract_project_resources(%{"project" => %{"links" => %{"nodes" => links}}})
+       when is_list(links) do
+    links
+    |> Enum.map(& &1["url"])
+    |> Enum.filter(&is_binary/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp extract_project_resources(_), do: []
 
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels

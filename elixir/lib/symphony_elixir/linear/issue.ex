@@ -17,6 +17,7 @@ defmodule SymphonyElixir.Linear.Issue do
     blocked_by: [],
     labels: [],
     project_labels: [],
+    project_resources: [],
     assigned_to_worker: true,
     created_at: nil,
     updated_at: nil
@@ -35,6 +36,7 @@ defmodule SymphonyElixir.Linear.Issue do
           project_description: String.t() | nil,
           labels: [String.t()],
           project_labels: [String.t()],
+          project_resources: [String.t()],
           assigned_to_worker: boolean(),
           created_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil
