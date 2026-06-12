@@ -32,6 +32,8 @@ defmodule SymphonyElixir.Linear.Client do
           }
         }
         project {
+          description
+          content
           labels {
             nodes {
               name
@@ -84,6 +86,8 @@ defmodule SymphonyElixir.Linear.Client do
           }
         }
         project {
+          description
+          content
           labels {
             nodes {
               name
@@ -475,6 +479,7 @@ defmodule SymphonyElixir.Linear.Client do
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
       project_labels: extract_project_labels(issue),
+      project_description: extract_project_description(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
@@ -561,6 +566,24 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_project_labels(_), do: []
+
+  # The `vibe:` project-binding block is typically written into the
+  # project's longer "content" document, but fall back to the shorter
+  # "description" field if content is empty so either location works.
+  defp extract_project_description(%{"project" => %{} = project}) do
+    case project["content"] do
+      content when is_binary(content) and content != "" ->
+        content
+
+      _ ->
+        case project["description"] do
+          description when is_binary(description) and description != "" -> description
+          _ -> nil
+        end
+    end
+  end
+
+  defp extract_project_description(_), do: nil
 
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels

@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.BindingTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Redact
+
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
@@ -36,6 +38,66 @@ defmodule SymphonyElixir.BindingTest do
 
   defp issue(labels: labels, project_labels: plabels) do
     %SymphonyElixir.Linear.Issue{identifier: "TEST-1", labels: labels, project_labels: plabels}
+  end
+
+  defp issue(labels: labels, project_description: description) do
+    %SymphonyElixir.Linear.Issue{
+      identifier: "TEST-1",
+      labels: labels,
+      project_labels: [],
+      project_description: description
+    }
+  end
+
+  defp issue(labels: labels, project_labels: plabels, project_description: description) do
+    %SymphonyElixir.Linear.Issue{
+      identifier: "TEST-1",
+      labels: labels,
+      project_labels: plabels,
+      project_description: description
+    }
+  end
+
+  # Builds a Linear project description containing a fenced ```yaml code
+  # block with a top-level `vibe:` key, mirroring how a user would paste
+  # project-level binding config into a Linear project's description.
+  defp project_description_with_vibe(vibe_fields) do
+    """
+    ## Project Overview
+
+    This project ships fin_bot features.
+
+    ```yaml
+    #{vibe_yaml_block(vibe_fields)}
+    ```
+
+    More notes below the config block.
+    """
+  end
+
+  defp vibe_yaml_block(fields) do
+    ["vibe:"]
+    |> maybe_append(fields, :repo, &"  repo: #{&1}")
+    |> maybe_append(fields, :default_agent, &"  default_agent: #{&1}")
+    |> maybe_append(fields, :default_node, &"  default_node: #{&1}")
+    |> maybe_append(fields, :encrypt, &"  encrypt: #{&1}")
+    |> maybe_append_list(fields, :allowed_agents, "  allowed_agents:")
+    |> maybe_append_list(fields, :allowed_nodes, "  allowed_nodes:")
+    |> Enum.join("\n")
+  end
+
+  defp maybe_append(lines, fields, key, render) do
+    case Map.get(fields, key) do
+      nil -> lines
+      value -> lines ++ [render.(value)]
+    end
+  end
+
+  defp maybe_append_list(lines, fields, key, header) do
+    case Map.get(fields, key) do
+      nil -> lines
+      values -> lines ++ [header] ++ Enum.map(values, &"    - #{&1}")
+    end
   end
 
   # Produces the "binding:" YAML block string for write_workflow_file!
@@ -665,6 +727,201 @@ defmodule SymphonyElixir.BindingTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Project description `vibe:` block tests
+  # ---------------------------------------------------------------------------
+
+  describe "resolve/2 — project vibe binding" do
+    setup do
+      previous = System.get_env("SYMPHONY_NODE_ID")
+      System.delete_env("SYMPHONY_NODE_ID")
+      on_exit(fn -> restore_env("SYMPHONY_NODE_ID", previous) end)
+      :ok
+    end
+
+    test "no project vibe block leaves global defaults unchanged" do
+      settings = label_routing_settings()
+
+      description = "Just a plain project description, no config block here."
+      {:ok, resolved} = Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert resolved.agent == "codex"
+      assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
+      assert resolved.node == "joey-pc"
+      assert resolved.node_id == "node_f7cedd3b6590aff9"
+    end
+
+    test "project vibe repo is used when the issue has no repo label" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{repo: "vibe_interface_cli"})
+      {:ok, resolved} = Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/vibe_interface_cli"
+      assert resolved.agent == "codex"
+      assert resolved.node == "joey-pc"
+    end
+
+    test "project vibe default_agent is used when the issue has no agent label" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_agent: "mock"})
+      {:ok, resolved} = Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert resolved.agent == "mock"
+      assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
+      assert resolved.node == "joey-pc"
+    end
+
+    test "project vibe default_node is used when the issue has no node label" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_node: "company-node"})
+      {:ok, resolved} = Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert resolved.node == "company-node"
+      assert resolved.agent == "codex"
+      assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
+    end
+
+    test "issue repo label overrides the project vibe repo" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{repo: "vibe_interface_cli"})
+
+      {:ok, resolved} =
+        Binding.resolve(issue(labels: ["repo:universe-symphony"], project_description: description), settings)
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/universe-symphony"
+    end
+
+    test "issue agent label overrides the project vibe default_agent" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_agent: "mock"})
+
+      {:ok, resolved} =
+        Binding.resolve(issue(labels: ["agent:claude-code"], project_description: description), settings)
+
+      assert resolved.agent == "claude-code"
+    end
+
+    test "issue node label overrides the project vibe default_node" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_node: "company-node"})
+
+      {:ok, resolved} =
+        Binding.resolve(issue(labels: ["node:joey-pc"], project_description: description), settings)
+
+      assert resolved.node == "joey-pc"
+    end
+
+    test "invalid project vibe repo fails fast even when an issue repo label would otherwise win" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{repo: "some-other-repo"})
+
+      assert {:error, {:invalid_project_repo, {:unknown_repo, "some-other-repo", "some-other-repo", allowed}}} =
+               Binding.resolve(issue(labels: ["repo:fin_bot"], project_description: description), settings)
+
+      assert "fin_bot" in allowed
+    end
+
+    test "invalid project vibe default_agent fails fast" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_agent: "gpt5"})
+
+      assert {:error, {:invalid_project_default_agent, "gpt5", known}} =
+               Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert "codex" in known
+    end
+
+    test "invalid project vibe default_node fails fast" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_node: "gpu-cluster"})
+
+      assert {:error, {:invalid_project_default_node, "gpu-cluster", known}} =
+               Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert "joey-pc" in known
+      assert "company-node" in known
+    end
+
+    test "project vibe allowed_agents rejects a disallowed issue agent override" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{allowed_agents: ["codex", "mock"]})
+
+      assert {:error, {:agent_not_allowed_by_project, "claude-code", ["codex", "mock"]}} =
+               Binding.resolve(issue(labels: ["agent:claude-code"], project_description: description), settings)
+    end
+
+    test "project vibe allowed_nodes rejects a disallowed issue node override" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{allowed_nodes: ["joey-pc"]})
+
+      assert {:error, {:node_not_allowed_by_project, "company-node", ["joey-pc"]}} =
+               Binding.resolve(issue(labels: ["node:company-node"], project_description: description), settings)
+    end
+
+    test "issue label conflicts still fail fast even with a project vibe block present" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_agent: "mock"})
+
+      assert {:error, {:conflicting_labels, :agent, ["codex", "mock"]}} =
+               Binding.resolve(
+                 issue(labels: ["agent:codex", "agent:mock"], project_description: description),
+                 settings
+               )
+    end
+
+    test "global allowed_repos is still enforced for issue repo labels with a project vibe block present" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{default_agent: "mock"})
+
+      assert {:error, {:unknown_repo, "some-other-repo", "some-other-repo", allowed}} =
+               Binding.resolve(issue(labels: ["repo:some-other-repo"], project_description: description), settings)
+
+      assert "fin_bot" in allowed
+    end
+
+    test "binding resolution errors never include node relay tokens" do
+      settings =
+        settings_with_binding(%{
+          nodes: %{
+            "joey-pc" => %{
+              relay: "wss://vibe-relay.example.com",
+              token: "fake-relay-secret-99887",
+              node_id: "node_f7cedd3b6590aff9",
+              allowed_agents: ["mock", "claude-code", "codex"]
+            }
+          },
+          agents: %{
+            "mock" => %{permission_mode: "default"},
+            "claude-code" => %{permission_mode: "unsafe-skip"},
+            "codex" => %{permission_mode: "default"}
+          },
+          allowed_repos: ["fin_bot", "vibe_interface_cli", "universe-symphony"],
+          defaults: %{repo: "https://github.com/JozzyAI/fin_bot", node: "joey-pc", agent: "codex"}
+        })
+
+      description = project_description_with_vibe(%{default_node: "gpu-cluster"})
+      {:error, reason} = Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      message = Binding.describe_error(reason)
+
+      refute message =~ "fake-relay-secret-99887"
+      refute inspect(Redact.redact(reason)) =~ "fake-relay-secret-99887"
+    end
+  end
+
   describe "describe_error/1" do
     test "conflicting_labels message names both offending labels" do
       message = Binding.describe_error({:conflicting_labels, :agent, ["codex", "mock"]})
@@ -690,6 +947,51 @@ defmodule SymphonyElixir.BindingTest do
 
       assert message =~ "some-other-repo"
       assert message =~ "fin_bot"
+    end
+
+    test "invalid_project_repo message names vibe.repo and the offending value" do
+      message =
+        Binding.describe_error(
+          {:invalid_project_repo, {:unknown_repo, "some-other-repo", "some-other-repo", ["fin_bot"]}}
+        )
+
+      assert message =~ "vibe.repo"
+      assert message =~ "some-other-repo"
+    end
+
+    test "invalid_project_default_agent message names vibe.default_agent and known agents" do
+      message = Binding.describe_error({:invalid_project_default_agent, "gpt5", ["codex", "mock"]})
+
+      assert message =~ "vibe.default_agent"
+      assert message =~ "gpt5"
+      assert message =~ "codex"
+    end
+
+    test "invalid_project_default_node message names vibe.default_node and known nodes" do
+      message = Binding.describe_error({:invalid_project_default_node, "gpu-cluster", ["joey-pc"]})
+
+      assert message =~ "vibe.default_node"
+      assert message =~ "gpu-cluster"
+    end
+
+    test "agent_not_allowed_by_project message names the agent and the project allow-list" do
+      message = Binding.describe_error({:agent_not_allowed_by_project, "claude-code", ["codex", "mock"]})
+
+      assert message =~ "agent:claude-code"
+      assert message =~ "allowed_agents"
+    end
+
+    test "node_not_allowed_by_project message names the node and the project allow-list" do
+      message = Binding.describe_error({:node_not_allowed_by_project, "company-node", ["joey-pc"]})
+
+      assert message =~ "node:company-node"
+      assert message =~ "allowed_nodes"
+    end
+
+    test "invalid_project_vibe_config message mentions the vibe: block" do
+      message = Binding.describe_error({:invalid_project_vibe_config, :project_vibe_not_a_map})
+
+      assert message =~ "vibe:"
     end
   end
 
