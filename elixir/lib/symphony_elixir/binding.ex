@@ -1,11 +1,22 @@
 defmodule SymphonyElixir.Binding do
   @moduledoc """
-  Resolves repo/node/agent binding from Linear labels and WORKFLOW.md config.
+  Resolves repo/node/agent binding from Linear labels, the Linear project's
+  `vibe:` description block, and WORKFLOW.md config.
 
-  Labels are parsed from issue labels and project labels. Resolution priority:
-    1. Issue labels
-    2. Project labels
-    3. binding.defaults (WORKFLOW.md)
+  Labels are parsed from issue labels and project labels. Resolution priority
+  for each of `repo`/`node`/`agent`, highest first:
+    1. Issue labels — `agent:*`/`repo:*`/`node:*` set directly on the issue.
+    2. Project labels — the *same label vocabulary* (`agent:*`/`repo:*`/
+       `node:*`), but applied as labels on the Linear *project* that the
+       issue belongs to. This is a distinct mechanism from #3 below — do
+       not confuse "a label on the project" with "the project's
+       *description* text".
+    3. Linear project *description*'s `vibe:` block — project-level
+       defaults (`repo`, `default_agent`, `default_node`, `encrypt`) and
+       allow-lists (`allowed_agents`, `allowed_nodes`) parsed from a fenced
+       ```yaml code block in the project's description/content. See
+       `SymphonyElixir.Linear.ProjectVibeConfig` for the exact format.
+    4. binding.defaults (WORKFLOW.md, global fallback)
 
   Label syntax (colon and slash forms are both supported):
     repo:https://github.com/JozzyAI/fin_bot
@@ -15,7 +26,15 @@ defmodule SymphonyElixir.Binding do
     repo/JozzyAI/fin_bot
     node:company-node  /  node/company-node
     agent:claude-code  /  agent/claude-code
+
+  If a project's `vibe:` block is present but invalid (e.g. an unknown
+  repo, agent, or node, or a `default_agent`/`default_node` that falls
+  outside that same block's own `allowed_agents`/`allowed_nodes`),
+  resolution fails fast rather than silently falling back to WORKFLOW
+  defaults.
   """
+
+  alias SymphonyElixir.Linear.ProjectVibeConfig
 
   @type label_tag :: {:repo, String.t()} | {:node, String.t()} | {:agent, String.t()} | :unknown
 
@@ -169,8 +188,60 @@ defmodule SymphonyElixir.Binding do
     "Binding resolved without a repo_url — check `binding.defaults.repo` and `repo:*` labels in WORKFLOW.md."
   end
 
+  def describe_error({:invalid_project_vibe_config, reason}) do
+    "This project's `vibe:` configuration block is invalid: #{describe_project_vibe_parse_error(reason)}."
+  end
+
+  def describe_error({:invalid_project_repo, reason}) do
+    "This project's `vibe.repo` is invalid: #{describe_error(reason)}"
+  end
+
+  def describe_error({:invalid_project_default_agent, name, known}) do
+    "This project's `vibe.default_agent: #{name}` is not a configured agent — configured agents are: #{Enum.join(known, ", ")}."
+  end
+
+  def describe_error({:invalid_project_default_node, name, known}) do
+    "This project's `vibe.default_node: #{name}` is not a configured node — configured nodes are: #{Enum.join(known, ", ")}."
+  end
+
+  def describe_error({:invalid_project_default_node_id, name}) do
+    "This project's `vibe.default_node: #{name}` has no configured `node_id` and SYMPHONY_NODE_ID is not set."
+  end
+
+  def describe_error({:agent_not_allowed_by_project, name, allowed}) do
+    "Agent `agent:#{name}` is not in this project's `vibe.allowed_agents` (allowed: #{Enum.join(allowed, ", ")})."
+  end
+
+  def describe_error({:node_not_allowed_by_project, name, allowed}) do
+    "Node `node:#{name}` is not in this project's `vibe.allowed_nodes` (allowed: #{Enum.join(allowed, ", ")})."
+  end
+
+  def describe_error({:project_vibe_inconsistent_default_agent, name, allowed}) do
+    "This project's `vibe:` configuration is internally inconsistent: `default_agent: #{name}` is not in its own `allowed_agents` (#{Enum.join(allowed, ", ")})."
+  end
+
+  def describe_error({:project_vibe_inconsistent_default_node, name, allowed}) do
+    "This project's `vibe:` configuration is internally inconsistent: `default_node: #{name}` is not in its own `allowed_nodes` (#{Enum.join(allowed, ", ")})."
+  end
+
   def describe_error(reason) do
     "Binding resolution failed: #{inspect(reason)}."
+  end
+
+  defp describe_project_vibe_parse_error(:project_vibe_not_a_map) do
+    "the `vibe:` value must be a mapping, not a scalar or list"
+  end
+
+  defp describe_project_vibe_parse_error({:project_vibe_invalid_field, key}) do
+    "field `#{key}` has an invalid type"
+  end
+
+  defp describe_project_vibe_parse_error({:project_vibe_yaml_error, reason}) do
+    "could not parse YAML (#{inspect(reason)})"
+  end
+
+  defp describe_project_vibe_parse_error(reason) do
+    inspect(reason)
   end
 
   # ---------------------------------------------------------------------------
@@ -188,10 +259,6 @@ defmodule SymphonyElixir.Binding do
     project_extracted = extract_labels(Map.get(issue, :project_labels) || [])
     defaults = binding.defaults || %{}
 
-    raw_repo = issue_extracted.repo || project_extracted.repo || struct_get(defaults, :repo)
-    raw_node = issue_extracted.node || project_extracted.node || struct_get(defaults, :node)
-    raw_agent = issue_extracted.agent || project_extracted.agent || struct_get(defaults, :agent)
-
     {allowed_orgs, allowed_repos} =
       case binding.repo_policy do
         nil ->
@@ -204,8 +271,18 @@ defmodule SymphonyElixir.Binding do
     nodes = binding.nodes || %{}
     agents = binding.agents || %{}
 
+    label_agent = issue_extracted.agent || project_extracted.agent
+    label_node = issue_extracted.node || project_extracted.node
+
     with :ok <- check_no_conflicts(issue_extracted.conflicts),
          :ok <- check_no_conflicts(project_extracted.conflicts),
+         {:ok, project_vibe} <- ProjectVibeConfig.parse(Map.get(issue, :project_description)),
+         :ok <- validate_project_vibe(project_vibe, allowed_orgs, allowed_repos, nodes, agents),
+         :ok <- check_project_allowed(label_agent, project_vibe_field(project_vibe, :allowed_agents), :agent_not_allowed_by_project),
+         :ok <- check_project_allowed(label_node, project_vibe_field(project_vibe, :allowed_nodes), :node_not_allowed_by_project),
+         raw_repo = issue_extracted.repo || project_extracted.repo || project_vibe_field(project_vibe, :repo) || struct_get(defaults, :repo),
+         raw_node = label_node || project_vibe_field(project_vibe, :default_node) || struct_get(defaults, :node),
+         raw_agent = label_agent || project_vibe_field(project_vibe, :default_agent) || struct_get(defaults, :agent),
          {:ok, repo_url} <- resolve_repo(raw_repo, allowed_orgs, allowed_repos),
          {:ok, node_name} <- resolve_node(raw_node, nodes),
          {:ok, agent_name} <- resolve_agent(raw_agent, node_name, nodes, agents),
@@ -221,10 +298,122 @@ defmodule SymphonyElixir.Binding do
          node_id: node_id,
          relay: Map.get(node_config, "relay"),
          token: Map.get(node_config, "token"),
-         encrypt: struct_get(defaults, :encrypt) == true,
+         encrypt: resolve_encrypt(project_vibe, defaults),
          agent: agent_name,
          permission_mode: Map.get(agent_config, "permission_mode", "default")
        }}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: project-level `vibe:` binding config (from project description)
+  # ---------------------------------------------------------------------------
+
+  defp project_vibe_field(nil, _key), do: nil
+  defp project_vibe_field(project_vibe, key), do: Map.get(project_vibe, key)
+
+  defp resolve_encrypt(project_vibe, defaults) do
+    case project_vibe_field(project_vibe, :encrypt) do
+      nil -> struct_get(defaults, :encrypt) == true
+      value when is_boolean(value) -> value
+    end
+  end
+
+  # A project's `vibe:` block is a contract: if it declares a `repo`,
+  # `default_agent`, or `default_node`, that value must be valid on its
+  # own (regardless of whether this particular issue ends up using it),
+  # so misconfiguration is caught immediately instead of surfacing later
+  # on a different issue.
+  defp validate_project_vibe(nil, _allowed_orgs, _allowed_repos, _nodes, _agents), do: :ok
+
+  defp validate_project_vibe(project_vibe, allowed_orgs, allowed_repos, nodes, agents) do
+    with :ok <- validate_project_repo(project_vibe.repo, allowed_orgs, allowed_repos),
+         :ok <- validate_project_agent(project_vibe.default_agent, agents),
+         :ok <- validate_project_node(project_vibe.default_node, nodes),
+         :ok <- validate_project_default_agent_allowed(project_vibe.default_agent, project_vibe.allowed_agents),
+         :ok <- validate_project_default_node_allowed(project_vibe.default_node, project_vibe.allowed_nodes) do
+      :ok
+    end
+  end
+
+  defp validate_project_repo(nil, _allowed_orgs, _allowed_repos), do: :ok
+
+  defp validate_project_repo(repo, allowed_orgs, allowed_repos) do
+    case resolve_repo(repo, allowed_orgs, allowed_repos) do
+      {:ok, _repo_url} -> :ok
+      {:error, reason} -> {:error, {:invalid_project_repo, reason}}
+    end
+  end
+
+  defp validate_project_agent(nil, _agents), do: :ok
+
+  defp validate_project_agent(name, agents) do
+    if Map.has_key?(agents, name) do
+      :ok
+    else
+      {:error, {:invalid_project_default_agent, name, Map.keys(agents)}}
+    end
+  end
+
+  defp validate_project_node(nil, _nodes), do: :ok
+
+  defp validate_project_node(name, nodes) do
+    if Map.has_key?(nodes, name) do
+      node_config = Map.get(nodes, name, %{})
+
+      case resolve_node_id(Map.get(node_config, "node_id"), name) do
+        {:ok, _node_id} -> :ok
+        {:error, _reason} -> {:error, {:invalid_project_default_node_id, name}}
+      end
+    else
+      {:error, {:invalid_project_default_node, name, Map.keys(nodes)}}
+    end
+  end
+
+  # A project's `vibe:` block is internally inconsistent if its own
+  # `default_agent`/`default_node` falls outside its own
+  # `allowed_agents`/`allowed_nodes` allow-list — no issue in this project
+  # could ever resolve successfully, so fail fast here rather than letting
+  # every issue dispatch fail individually with `*_not_allowed_by_project`.
+  defp validate_project_default_agent_allowed(nil, _allowed_agents), do: :ok
+  defp validate_project_default_agent_allowed(_name, nil), do: :ok
+  defp validate_project_default_agent_allowed(_name, []), do: :ok
+
+  defp validate_project_default_agent_allowed(name, allowed_agents) do
+    if Enum.member?(allowed_agents, name) do
+      :ok
+    else
+      {:error, {:project_vibe_inconsistent_default_agent, name, allowed_agents}}
+    end
+  end
+
+  defp validate_project_default_node_allowed(nil, _allowed_nodes), do: :ok
+  defp validate_project_default_node_allowed(_name, nil), do: :ok
+  defp validate_project_default_node_allowed(_name, []), do: :ok
+
+  defp validate_project_default_node_allowed(name, allowed_nodes) do
+    if Enum.member?(allowed_nodes, name) do
+      :ok
+    else
+      {:error, {:project_vibe_inconsistent_default_node, name, allowed_nodes}}
+    end
+  end
+
+  # Restricts a label-driven agent/node override to the project's
+  # `vibe.allowed_agents`/`vibe.allowed_nodes` list, when configured. A
+  # nil label value (no override on this issue or its project labels)
+  # or an absent/empty allow-list is always permitted — the constraint
+  # only governs explicit label overrides, not the project's own
+  # defaults or WORKFLOW.md's global defaults.
+  defp check_project_allowed(nil, _allowed, _error_tag), do: :ok
+  defp check_project_allowed(_label_value, nil, _error_tag), do: :ok
+  defp check_project_allowed(_label_value, [], _error_tag), do: :ok
+
+  defp check_project_allowed(label_value, allowed, error_tag) when is_list(allowed) do
+    if Enum.member?(allowed, label_value) do
+      :ok
+    else
+      {:error, {error_tag, label_value, allowed}}
     end
   end
 
