@@ -3,10 +3,19 @@ defmodule SymphonyElixir.Binding do
   Resolves repo/node/agent binding from Linear labels, the Linear project's
   `vibe:` description block, and WORKFLOW.md config.
 
-  Labels are parsed from issue labels and project labels. Resolution priority:
-    1. Issue labels
-    2. Project labels
-    3. Linear project description `vibe:` block (project-level defaults)
+  Labels are parsed from issue labels and project labels. Resolution priority
+  for each of `repo`/`node`/`agent`, highest first:
+    1. Issue labels — `agent:*`/`repo:*`/`node:*` set directly on the issue.
+    2. Project labels — the *same label vocabulary* (`agent:*`/`repo:*`/
+       `node:*`), but applied as labels on the Linear *project* that the
+       issue belongs to. This is a distinct mechanism from #3 below — do
+       not confuse "a label on the project" with "the project's
+       *description* text".
+    3. Linear project *description*'s `vibe:` block — project-level
+       defaults (`repo`, `default_agent`, `default_node`, `encrypt`) and
+       allow-lists (`allowed_agents`, `allowed_nodes`) parsed from a fenced
+       ```yaml code block in the project's description/content. See
+       `SymphonyElixir.Linear.ProjectVibeConfig` for the exact format.
     4. binding.defaults (WORKFLOW.md, global fallback)
 
   Label syntax (colon and slash forms are both supported):
@@ -18,15 +27,11 @@ defmodule SymphonyElixir.Binding do
     node:company-node  /  node/company-node
     agent:claude-code  /  agent/claude-code
 
-  A Linear project's description may contain a fenced ```yaml code block
-  with a top-level `vibe:` key providing project-wide defaults (`repo`,
-  `default_agent`, `default_node`, `encrypt`) and allow-lists
-  (`allowed_agents`, `allowed_nodes`) constraining which agents/nodes a
-  label on an issue in that project may select. See
-  `SymphonyElixir.Linear.ProjectVibeConfig` for the exact format. If a
-  project's `vibe:` block is present but invalid (e.g. an unknown repo,
-  agent, or node), resolution fails fast rather than silently falling back
-  to WORKFLOW defaults.
+  If a project's `vibe:` block is present but invalid (e.g. an unknown
+  repo, agent, or node, or a `default_agent`/`default_node` that falls
+  outside that same block's own `allowed_agents`/`allowed_nodes`),
+  resolution fails fast rather than silently falling back to WORKFLOW
+  defaults.
   """
 
   alias SymphonyElixir.Linear.ProjectVibeConfig
@@ -211,6 +216,14 @@ defmodule SymphonyElixir.Binding do
     "Node `node:#{name}` is not in this project's `vibe.allowed_nodes` (allowed: #{Enum.join(allowed, ", ")})."
   end
 
+  def describe_error({:project_vibe_inconsistent_default_agent, name, allowed}) do
+    "This project's `vibe:` configuration is internally inconsistent: `default_agent: #{name}` is not in its own `allowed_agents` (#{Enum.join(allowed, ", ")})."
+  end
+
+  def describe_error({:project_vibe_inconsistent_default_node, name, allowed}) do
+    "This project's `vibe:` configuration is internally inconsistent: `default_node: #{name}` is not in its own `allowed_nodes` (#{Enum.join(allowed, ", ")})."
+  end
+
   def describe_error(reason) do
     "Binding resolution failed: #{inspect(reason)}."
   end
@@ -316,7 +329,9 @@ defmodule SymphonyElixir.Binding do
   defp validate_project_vibe(project_vibe, allowed_orgs, allowed_repos, nodes, agents) do
     with :ok <- validate_project_repo(project_vibe.repo, allowed_orgs, allowed_repos),
          :ok <- validate_project_agent(project_vibe.default_agent, agents),
-         :ok <- validate_project_node(project_vibe.default_node, nodes) do
+         :ok <- validate_project_node(project_vibe.default_node, nodes),
+         :ok <- validate_project_default_agent_allowed(project_vibe.default_agent, project_vibe.allowed_agents),
+         :ok <- validate_project_default_node_allowed(project_vibe.default_node, project_vibe.allowed_nodes) do
       :ok
     end
   end
@@ -352,6 +367,35 @@ defmodule SymphonyElixir.Binding do
       end
     else
       {:error, {:invalid_project_default_node, name, Map.keys(nodes)}}
+    end
+  end
+
+  # A project's `vibe:` block is internally inconsistent if its own
+  # `default_agent`/`default_node` falls outside its own
+  # `allowed_agents`/`allowed_nodes` allow-list — no issue in this project
+  # could ever resolve successfully, so fail fast here rather than letting
+  # every issue dispatch fail individually with `*_not_allowed_by_project`.
+  defp validate_project_default_agent_allowed(nil, _allowed_agents), do: :ok
+  defp validate_project_default_agent_allowed(_name, nil), do: :ok
+  defp validate_project_default_agent_allowed(_name, []), do: :ok
+
+  defp validate_project_default_agent_allowed(name, allowed_agents) do
+    if Enum.member?(allowed_agents, name) do
+      :ok
+    else
+      {:error, {:project_vibe_inconsistent_default_agent, name, allowed_agents}}
+    end
+  end
+
+  defp validate_project_default_node_allowed(nil, _allowed_nodes), do: :ok
+  defp validate_project_default_node_allowed(_name, nil), do: :ok
+  defp validate_project_default_node_allowed(_name, []), do: :ok
+
+  defp validate_project_default_node_allowed(name, allowed_nodes) do
+    if Enum.member?(allowed_nodes, name) do
+      :ok
+    else
+      {:error, {:project_vibe_inconsistent_default_node, name, allowed_nodes}}
     end
   end
 

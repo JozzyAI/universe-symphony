@@ -920,6 +920,84 @@ defmodule SymphonyElixir.BindingTest do
       refute message =~ "fake-relay-secret-99887"
       refute inspect(Redact.redact(reason)) =~ "fake-relay-secret-99887"
     end
+
+    test "project vibe default_agent outside its own allowed_agents fails fast" do
+      settings = label_routing_settings()
+
+      description =
+        project_description_with_vibe(%{
+          repo: "fin_bot",
+          default_agent: "codex",
+          allowed_agents: ["claude-code"]
+        })
+
+      assert {:error, {:project_vibe_inconsistent_default_agent, "codex", ["claude-code"]}} =
+               Binding.resolve(issue(labels: [], project_description: description), settings)
+    end
+
+    test "project vibe default_node outside its own allowed_nodes fails fast" do
+      settings = label_routing_settings()
+
+      description =
+        project_description_with_vibe(%{
+          repo: "fin_bot",
+          default_node: "joey-pc",
+          allowed_nodes: ["company-node"]
+        })
+
+      assert {:error, {:project_vibe_inconsistent_default_node, "joey-pc", ["company-node"]}} =
+               Binding.resolve(issue(labels: [], project_description: description), settings)
+    end
+
+    test "project vibe default_agent inside its own allowed_agents resolves normally" do
+      settings = label_routing_settings()
+
+      description =
+        project_description_with_vibe(%{default_agent: "mock", allowed_agents: ["codex", "mock"]})
+
+      {:ok, resolved} = Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert resolved.agent == "mock"
+    end
+
+    test "project vibe default_node inside its own allowed_nodes resolves normally" do
+      settings = label_routing_settings()
+
+      description =
+        project_description_with_vibe(%{default_node: "company-node", allowed_nodes: ["joey-pc", "company-node"]})
+
+      {:ok, resolved} = Binding.resolve(issue(labels: [], project_description: description), settings)
+
+      assert resolved.node == "company-node"
+    end
+
+    test "issue agent label still overrides a consistent project vibe default_agent + allowed_agents" do
+      settings = label_routing_settings()
+
+      description =
+        project_description_with_vibe(%{
+          default_agent: "mock",
+          allowed_agents: ["codex", "mock", "claude-code"]
+        })
+
+      {:ok, resolved} =
+        Binding.resolve(issue(labels: ["agent:claude-code"], project_description: description), settings)
+
+      assert resolved.agent == "claude-code"
+    end
+
+    test "issue label conflicts still fail fast even when the project vibe block is itself inconsistent" do
+      settings = label_routing_settings()
+
+      description =
+        project_description_with_vibe(%{default_agent: "claude-code", allowed_agents: ["mock"]})
+
+      assert {:error, {:conflicting_labels, :agent, ["codex", "mock"]}} =
+               Binding.resolve(
+                 issue(labels: ["agent:codex", "agent:mock"], project_description: description),
+                 settings
+               )
+    end
   end
 
   describe "describe_error/1" do
@@ -992,6 +1070,24 @@ defmodule SymphonyElixir.BindingTest do
       message = Binding.describe_error({:invalid_project_vibe_config, :project_vibe_not_a_map})
 
       assert message =~ "vibe:"
+    end
+
+    test "project_vibe_inconsistent_default_agent message explains the inconsistency" do
+      message = Binding.describe_error({:project_vibe_inconsistent_default_agent, "codex", ["claude-code"]})
+
+      assert message =~ "internally inconsistent"
+      assert message =~ "default_agent: codex"
+      assert message =~ "allowed_agents"
+      assert message =~ "claude-code"
+    end
+
+    test "project_vibe_inconsistent_default_node message explains the inconsistency" do
+      message = Binding.describe_error({:project_vibe_inconsistent_default_node, "joey-pc", ["company-node"]})
+
+      assert message =~ "internally inconsistent"
+      assert message =~ "default_node: joey-pc"
+      assert message =~ "allowed_nodes"
+      assert message =~ "company-node"
     end
   end
 
