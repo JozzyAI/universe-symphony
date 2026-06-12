@@ -125,12 +125,26 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
+      settings.tracker.kind == "linear" and not linear_project_scope_configured?(settings.tracker) ->
         {:error, :missing_linear_project_slug}
+
+      settings.tracker.kind == "linear" and settings.tracker.auto_discover_projects and
+          not is_binary(settings.tracker.team_key) ->
+        {:error, :missing_linear_team_key}
 
       true ->
         :ok
     end
+  end
+
+  # A "linear" tracker needs at least one way to scope which issues to poll:
+  # a single project_slug (legacy), an explicit project_slugs list, or
+  # auto_discover_projects (which derives the project list from the
+  # configured team_key — validated separately below).
+  defp linear_project_scope_configured?(tracker) do
+    is_binary(tracker.project_slug) or
+      (is_list(tracker.project_slugs) and tracker.project_slugs != []) or
+      tracker.auto_discover_projects == true
   end
 
   defp format_config_error(reason) do

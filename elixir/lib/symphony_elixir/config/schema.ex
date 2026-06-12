@@ -49,6 +49,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:project_slugs, {:array, :string}, default: [])
+      field(:team_key, :string)
+      field(:auto_discover_projects, :boolean, default: false)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
@@ -59,7 +62,18 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :project_slugs,
+          :team_key,
+          :auto_discover_projects,
+          :assignee,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
     end
@@ -168,11 +182,16 @@ defmodule SymphonyElixir.Config.Schema do
       field(:command, :string, default: "vibe")
       field(:agent, :string, default: "mock")
       # Remote relay fields — set these to dispatch runs to a remote Vibe Node.
-      field(:node, :string)               # node_id of the remote worker (e.g. "my-node")
-      field(:relay, :string)              # relay WebSocket URL (e.g. "ws://localhost:7433")
-      field(:token, :string)              # relay auth token; supports $ENV_VAR syntax
-      field(:encrypt, :boolean)           # true → pass --encrypt to vibe symphony start
-      field(:permission_mode, :string)    # "default" | "unsafe-skip"
+      # node_id of the remote worker (e.g. "my-node")
+      field(:node, :string)
+      # relay WebSocket URL (e.g. "ws://localhost:7433")
+      field(:relay, :string)
+      # relay auth token; supports $ENV_VAR syntax
+      field(:token, :string)
+      # true → pass --encrypt to vibe symphony start
+      field(:encrypt, :boolean)
+      # "default" | "unsafe-skip"
+      field(:permission_mode, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -236,11 +255,18 @@ defmodule SymphonyElixir.Config.Schema do
       embedded_schema do
         field(:allowed_github_orgs, {:array, :string}, default: [])
         field(:allowed_repos, {:array, :string}, default: [])
+        field(:allowed_repo_prefixes, {:array, :string}, default: [])
+        field(:allowed_repo_owners, {:array, :string}, default: [])
       end
 
       @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
       def changeset(schema, attrs) do
-        schema |> cast(attrs, [:allowed_github_orgs, :allowed_repos], empty_values: [])
+        schema
+        |> cast(
+          attrs,
+          [:allowed_github_orgs, :allowed_repos, :allowed_repo_prefixes, :allowed_repo_owners],
+          empty_values: []
+        )
       end
     end
 

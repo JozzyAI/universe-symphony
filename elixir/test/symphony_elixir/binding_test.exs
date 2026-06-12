@@ -100,6 +100,12 @@ defmodule SymphonyElixir.BindingTest do
     end
   end
 
+  defp repo_policy_list_yaml_block(_key, []), do: ""
+
+  defp repo_policy_list_yaml_block(key, values) do
+    "    #{key}:\n" <> Enum.map_join(values, "\n", &"      - #{&1}") <> "\n"
+  end
+
   # Produces the "binding:" YAML block string for write_workflow_file!
   defp binding_yaml_block(spec) do
     nodes_yaml =
@@ -135,17 +141,14 @@ defmodule SymphonyElixir.BindingTest do
     defaults = Map.get(spec, :defaults, %{})
     orgs = Map.get(spec, :allowed_github_orgs, ["JozzyAI"])
     allowed_repos = Map.get(spec, :allowed_repos, [])
+    allowed_repo_prefixes = Map.get(spec, :allowed_repo_prefixes, [])
+    allowed_repo_owners = Map.get(spec, :allowed_repo_owners, [])
 
     orgs_yaml = Enum.map_join(orgs, "\n", &"      - #{&1}")
 
-    allowed_repos_yaml =
-      case allowed_repos do
-        [] ->
-          ""
-
-        repos ->
-          "    allowed_repos:\n" <> Enum.map_join(repos, "\n", &"      - #{&1}") <> "\n"
-      end
+    allowed_repos_yaml = repo_policy_list_yaml_block("allowed_repos", allowed_repos)
+    allowed_repo_prefixes_yaml = repo_policy_list_yaml_block("allowed_repo_prefixes", allowed_repo_prefixes)
+    allowed_repo_owners_yaml = repo_policy_list_yaml_block("allowed_repo_owners", allowed_repo_owners)
 
     defaults_repo = Map.get(defaults, :repo, "https://github.com/JozzyAI/fin_bot")
     defaults_node = Map.get(defaults, :node, "company-node")
@@ -156,7 +159,7 @@ defmodule SymphonyElixir.BindingTest do
       repo_policy:
         allowed_github_orgs:
     #{orgs_yaml}
-    #{allowed_repos_yaml}  nodes:
+    #{allowed_repos_yaml}#{allowed_repo_prefixes_yaml}#{allowed_repo_owners_yaml}  nodes:
     #{nodes_yaml}
       agents:
     #{agents_yaml}
@@ -337,6 +340,66 @@ defmodule SymphonyElixir.BindingTest do
     test "repo with spaces is rejected" do
       settings = settings_with_binding(%{nodes: default_nodes()})
       assert {:error, {:invalid_repo_label, _}} = Binding.resolve(issue(labels: ["repo:bad name"]), settings)
+    end
+  end
+
+  describe "resolve/2 — repo_policy allowlist (allowed_repo_prefixes / allowed_repo_owners)" do
+    test "repo URL matching allowed_repo_prefixes is allowed even when allowed_github_orgs is empty" do
+      settings =
+        settings_with_binding(%{
+          nodes: default_nodes(),
+          allowed_github_orgs: [],
+          allowed_repo_prefixes: ["https://github.com/JozzyAI/"]
+        })
+
+      {:ok, resolved} =
+        Binding.resolve(issue(labels: ["repo:https://github.com/JozzyAI/fin_bot"]), settings)
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
+    end
+
+    test "repo URL outside allowed_repo_prefixes is rejected even when allowed_github_orgs is empty" do
+      settings =
+        settings_with_binding(%{
+          nodes: default_nodes(),
+          allowed_github_orgs: [],
+          allowed_repo_prefixes: ["https://github.com/JozzyAI/"]
+        })
+
+      {:error, {:invalid_repo_label, msg}} =
+        Binding.resolve(issue(labels: ["repo:https://github.com/evil-org/malware"]), settings)
+
+      assert msg =~ "evil-org"
+      assert msg =~ "allowed_repo_prefixes"
+    end
+
+    test "repo under an allowed_repo_owner is allowed even when allowed_github_orgs is empty" do
+      settings =
+        settings_with_binding(%{
+          nodes: default_nodes(),
+          allowed_github_orgs: [],
+          allowed_repo_owners: ["JozzyAI"]
+        })
+
+      {:ok, resolved} =
+        Binding.resolve(issue(labels: ["repo:https://github.com/JozzyAI/some-new-repo"]), settings)
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/some-new-repo"
+    end
+
+    test "repo under an org not in allowed_repo_owners is rejected" do
+      settings =
+        settings_with_binding(%{
+          nodes: default_nodes(),
+          allowed_github_orgs: [],
+          allowed_repo_owners: ["JozzyAI"]
+        })
+
+      {:error, {:invalid_repo_label, msg}} =
+        Binding.resolve(issue(labels: ["repo:https://github.com/evil-org/malware"]), settings)
+
+      assert msg =~ "evil-org"
+      assert msg =~ "allowed_repo_owners"
     end
   end
 
@@ -1018,10 +1081,7 @@ defmodule SymphonyElixir.BindingTest do
 
     test "unknown_repo message names the offending label and allowed repos" do
       message =
-        Binding.describe_error(
-          {:unknown_repo, "some-other-repo", "some-other-repo",
-           ["fin_bot", "vibe_interface_cli", "universe-symphony"]}
-        )
+        Binding.describe_error({:unknown_repo, "some-other-repo", "some-other-repo", ["fin_bot", "vibe_interface_cli", "universe-symphony"]})
 
       assert message =~ "some-other-repo"
       assert message =~ "fin_bot"
@@ -1029,9 +1089,7 @@ defmodule SymphonyElixir.BindingTest do
 
     test "invalid_project_repo message names vibe.repo and the offending value" do
       message =
-        Binding.describe_error(
-          {:invalid_project_repo, {:unknown_repo, "some-other-repo", "some-other-repo", ["fin_bot"]}}
-        )
+        Binding.describe_error({:invalid_project_repo, {:unknown_repo, "some-other-repo", "some-other-repo", ["fin_bot"]}})
 
       assert message =~ "vibe.repo"
       assert message =~ "some-other-repo"

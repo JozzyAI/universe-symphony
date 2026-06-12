@@ -103,6 +103,9 @@ defmodule SymphonyElixir.TestSupport do
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
           tracker_project_slug: "project",
+          tracker_project_slugs: [],
+          tracker_team_key: nil,
+          tracker_auto_discover_projects: false,
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
@@ -148,6 +151,9 @@ defmodule SymphonyElixir.TestSupport do
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
+    tracker_project_slugs = Keyword.get(config, :tracker_project_slugs)
+    tracker_team_key = Keyword.get(config, :tracker_team_key)
+    tracker_auto_discover_projects = Keyword.get(config, :tracker_auto_discover_projects)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
@@ -194,6 +200,9 @@ defmodule SymphonyElixir.TestSupport do
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
+        "  project_slugs: #{yaml_value(tracker_project_slugs)}",
+        "  team_key: #{yaml_value(tracker_team_key)}",
+        "  auto_discover_projects: #{yaml_value(tracker_auto_discover_projects)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
@@ -268,6 +277,12 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
+  defp repo_policy_list_yaml(_key, []), do: []
+
+  defp repo_policy_list_yaml(key, values) do
+    ["    #{key}:"] ++ Enum.map(values, &"      - #{yaml_value(&1)}")
+  end
+
   # binding is a raw YAML string block for test flexibility.
   # Pass pre-formatted YAML (without the top-level "binding:" key) as the value,
   # or pass a map: %{nodes: %{...}, agents: %{...}, defaults: %{...}, repo_policy: %{...}}.
@@ -281,12 +296,19 @@ defmodule SymphonyElixir.TestSupport do
     lines =
       if rp = Map.get(spec, :repo_policy) do
         orgs = Map.get(rp, :allowed_github_orgs, [])
+        allowed_repos = Map.get(rp, :allowed_repos, [])
+        allowed_repo_prefixes = Map.get(rp, :allowed_repo_prefixes, [])
+        allowed_repo_owners = Map.get(rp, :allowed_repo_owners, [])
 
         lines ++
           [
             "  repo_policy:",
             "    allowed_github_orgs:"
-          ] ++ Enum.map(orgs, &"      - #{yaml_value(&1)}")
+          ] ++
+          Enum.map(orgs, &"      - #{yaml_value(&1)}") ++
+          repo_policy_list_yaml("allowed_repos", allowed_repos) ++
+          repo_policy_list_yaml("allowed_repo_prefixes", allowed_repo_prefixes) ++
+          repo_policy_list_yaml("allowed_repo_owners", allowed_repo_owners)
       else
         lines
       end
@@ -302,10 +324,10 @@ defmodule SymphonyElixir.TestSupport do
             [
               "    #{name}:"
             ] ++
-              (relay && ["      relay: #{yaml_value(relay)}"] || []) ++
-              (token && ["      token: #{yaml_value(token)}"] || []) ++
-              (agents != [] &&
-                 ["      allowed_agents:"] ++ Enum.map(agents, &"        - #{yaml_value(&1)}") ||
+              ((relay && ["      relay: #{yaml_value(relay)}"]) || []) ++
+              ((token && ["      token: #{yaml_value(token)}"]) || []) ++
+              ((agents != [] &&
+                  ["      allowed_agents:"] ++ Enum.map(agents, &"        - #{yaml_value(&1)}")) ||
                  [])
           end)
 
