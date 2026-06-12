@@ -39,7 +39,7 @@ defmodule SymphonyElixir.Linear.Client do
               name
             }
           }
-          links {
+          externalLinks {
             nodes {
               url
               label
@@ -99,7 +99,7 @@ defmodule SymphonyElixir.Linear.Client do
               name
             }
           }
-          links {
+          externalLinks {
             nodes {
               url
               label
@@ -599,11 +599,12 @@ defmodule SymphonyElixir.Linear.Client do
   defp extract_project_description(_), do: nil
 
   # Project "Resources" (external links), as configured on the Linear
-  # project's overview page. Returned as a flat list of raw URL strings in
-  # whatever order Linear returns them; no filtering/interpretation happens
-  # here. See `SymphonyElixir.Linear.ProjectResources` for helpers that
-  # interpret these URLs (e.g. picking out GitHub repo links).
-  defp extract_project_resources(%{"project" => %{"links" => %{"nodes" => links}}})
+  # project's overview page — the `Project.externalLinks` GraphQL field
+  # (`EntityExternalLink` nodes). Returned as a flat list of raw URL strings
+  # in whatever order Linear returns them; no filtering/interpretation
+  # happens here. See `SymphonyElixir.Linear.ProjectResources` for helpers
+  # that interpret these URLs (e.g. picking out GitHub repo links).
+  defp extract_project_resources(%{"project" => %{"externalLinks" => %{"nodes" => links}}})
        when is_list(links) do
     links
     |> Enum.map(& &1["url"])

@@ -6,9 +6,11 @@ expected to fit into repo binding in the future.
 
 ## What's implemented today
 
-- `SymphonyElixir.Linear.Client` queries `project.links.nodes { url label }`
-  (the `ProjectLink` GraphQL type) alongside the existing
-  `project.description` / `project.content` / `project.labels` fields.
+- `SymphonyElixir.Linear.Client` queries `project.externalLinks.nodes { url label }`
+  (the `EntityExternalLink` GraphQL type, via `Project.externalLinks`)
+  alongside the existing `project.description` / `project.content` /
+  `project.labels` fields. Verified live against Linear's API — `links` is
+  *not* a valid field on `Project`; `externalLinks` is.
 - `SymphonyElixir.Linear.Issue.project_resources` is a flat list of the raw
   resource URLs for the issue's project, in the order Linear returns them.
   Links without a `url` are dropped; nothing else is filtered or interpreted.
@@ -28,8 +30,8 @@ intended repo resolution order — highest priority first — is:
 
 1. **Issue `repo:*` label** — explicit per-issue override (unchanged).
 2. **Project `repo:*` label** — explicit per-project override (unchanged).
-3. **Linear Project GitHub resource link** — a `ProjectLink` whose URL
-   resolves via `ProjectResources.github_repo_url/1` to a single
+3. **Linear Project GitHub resource link** — an `EntityExternalLink` whose
+   URL resolves via `ProjectResources.github_repo_url/1` to a single
    `https://github.com/<org>/<repo>`.
 4. **Natural-language repo mention in the project description** — a future
    Project Profile extraction step (not implemented by this spike).

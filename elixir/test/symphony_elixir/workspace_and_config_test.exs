@@ -552,7 +552,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       "identifier" => "MT-1",
       "state" => %{"name" => "Todo"},
       "project" => %{
-        "links" => %{
+        "externalLinks" => %{
           "nodes" => [
             %{"url" => "https://github.com/JozzyAI/fin_bot", "label" => "Repo"}
           ]
@@ -572,7 +572,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       "state" => %{"name" => "Todo"},
       "project" => %{
         "description" => "No resources here.",
-        "links" => %{"nodes" => []}
+        "externalLinks" => %{"nodes" => []}
       }
     }
 
@@ -599,7 +599,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       "identifier" => "MT-1",
       "state" => %{"name" => "Todo"},
       "project" => %{
-        "links" => %{
+        "externalLinks" => %{
           "nodes" => [
             %{"url" => "https://github.com/JozzyAI/fin_bot", "label" => "Repo"},
             %{"url" => "https://github.com/JozzyAI/vibe_interface_cli", "label" => "Vibe repo"},
@@ -629,7 +629,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       "identifier" => "MT-1",
       "state" => %{"name" => "Todo"},
       "project" => %{
-        "links" => %{
+        "externalLinks" => %{
           "nodes" => [
             %{"label" => "Untitled"},
             %{"url" => "https://github.com/JozzyAI/fin_bot", "label" => "Repo"}

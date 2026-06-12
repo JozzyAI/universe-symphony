@@ -4,8 +4,8 @@ defmodule SymphonyElixir.Linear.ProjectResources do
 
   `SymphonyElixir.Linear.Issue.project_resources` is a flat list of raw URL
   strings taken from the Linear project's "Resources" section (the
-  `project.links` GraphQL field). This module picks out GitHub repository
-  links from that list.
+  `project.externalLinks` GraphQL field). This module picks out GitHub
+  repository links from that list.
 
   This is a discovery/extraction helper only — it does not influence repo
   binding yet. See `SymphonyElixir.Binding` for the current resolution order
