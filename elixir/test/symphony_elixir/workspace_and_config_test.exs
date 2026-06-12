@@ -1493,4 +1493,87 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+
+  describe "tracker project scope — project_slug / project_slugs / auto_discover_projects" do
+    test "single project_slug is backward compatible" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_project_slug: "spendlens",
+        tracker_project_slugs: [],
+        tracker_team_key: nil,
+        tracker_auto_discover_projects: false
+      )
+
+      config = Config.settings!()
+      assert config.tracker.project_slug == "spendlens"
+      assert config.tracker.project_slugs == []
+      assert config.tracker.auto_discover_projects == false
+      assert :ok = Config.validate!()
+
+      assert {:ok, ["spendlens"]} = Client.resolve_project_slugs_for_test(config.tracker)
+    end
+
+    test "project_slugs list is used when configured" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_project_slug: nil,
+        tracker_project_slugs: ["spendlens", "vibe-interface-cli"],
+        tracker_team_key: nil,
+        tracker_auto_discover_projects: false
+      )
+
+      config = Config.settings!()
+      assert config.tracker.project_slugs == ["spendlens", "vibe-interface-cli"]
+      assert :ok = Config.validate!()
+
+      assert {:ok, ["spendlens", "vibe-interface-cli"]} =
+               Client.resolve_project_slugs_for_test(config.tracker)
+    end
+
+    test "project_slugs takes priority over project_slug when both are configured" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_project_slug: "legacy-slug",
+        tracker_project_slugs: ["spendlens", "vibe-interface-cli"]
+      )
+
+      config = Config.settings!()
+
+      assert {:ok, ["spendlens", "vibe-interface-cli"]} =
+               Client.resolve_project_slugs_for_test(config.tracker)
+    end
+
+    test "auto_discover_projects requires team_key" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_project_slug: nil,
+        tracker_project_slugs: [],
+        tracker_team_key: nil,
+        tracker_auto_discover_projects: true
+      )
+
+      assert {:error, :missing_linear_team_key} = Config.validate!()
+    end
+
+    test "auto_discover_projects with team_key passes validation" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_project_slug: nil,
+        tracker_project_slugs: [],
+        tracker_team_key: "JOZ",
+        tracker_auto_discover_projects: true
+      )
+
+      config = Config.settings!()
+      assert config.tracker.team_key == "JOZ"
+      assert config.tracker.auto_discover_projects == true
+      assert :ok = Config.validate!()
+    end
+
+    test "linear tracker requires at least one project scope configuration" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_project_slug: nil,
+        tracker_project_slugs: [],
+        tracker_team_key: nil,
+        tracker_auto_discover_projects: false
+      )
+
+      assert {:error, :missing_linear_project_slug} = Config.validate!()
+    end
+  end
 end

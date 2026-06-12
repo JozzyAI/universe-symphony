@@ -38,6 +38,13 @@ defmodule SymphonyElixir.Binding do
 
   @type label_tag :: {:repo, String.t()} | {:node, String.t()} | {:agent, String.t()} | :unknown
 
+  @type repo_scope :: %{
+          allowed_orgs: [String.t()],
+          allowed_repos: [String.t()],
+          allowed_repo_prefixes: [String.t()],
+          allowed_repo_owners: [String.t()]
+        }
+
   @type resolved :: %{
           repo_url: String.t() | nil,
           repo_branch_prefix: String.t() | nil,
@@ -144,6 +151,44 @@ defmodule SymphonyElixir.Binding do
     else
       do_resolve_legacy(settings)
     end
+  end
+
+  @doc """
+  Build the repo allow-list scope (`allowed_github_orgs`, `allowed_repos`,
+  `allowed_repo_prefixes`, `allowed_repo_owners`) from `binding.repo_policy`.
+  """
+  @spec repo_scope(map() | nil) :: repo_scope()
+  def repo_scope(nil), do: empty_repo_scope()
+
+  def repo_scope(binding) do
+    case binding.repo_policy do
+      nil ->
+        empty_repo_scope()
+
+      policy ->
+        %{
+          allowed_orgs: struct_get(policy, :allowed_github_orgs) || [],
+          allowed_repos: struct_get(policy, :allowed_repos) || [],
+          allowed_repo_prefixes: struct_get(policy, :allowed_repo_prefixes) || [],
+          allowed_repo_owners: struct_get(policy, :allowed_repo_owners) || []
+        }
+    end
+  end
+
+  defp empty_repo_scope,
+    do: %{allowed_orgs: [], allowed_repos: [], allowed_repo_prefixes: [], allowed_repo_owners: []}
+
+  @doc """
+  Validate a repo reference (full GitHub URL, `org/repo`, or bare repo name)
+  against `settings.binding`'s `repo_policy`, returning the resolved
+  `https://github.com/...` URL (or `{:ok, nil}` for a `nil` repo).
+
+  Used by `SymphonyElixir.Linear.ProjectDiscovery` to validate a discovered
+  project's `vibe.repo` before treating that project as Symphony-enabled.
+  """
+  @spec validate_repo(String.t() | nil, struct()) :: {:ok, String.t() | nil} | {:error, term()}
+  def validate_repo(repo, settings) do
+    resolve_repo(repo, repo_scope(settings.binding))
   end
 
   @doc """
@@ -258,15 +303,7 @@ defmodule SymphonyElixir.Binding do
     issue_extracted = extract_labels(issue.labels || [])
     project_extracted = extract_labels(Map.get(issue, :project_labels) || [])
     defaults = binding.defaults || %{}
-
-    {allowed_orgs, allowed_repos} =
-      case binding.repo_policy do
-        nil ->
-          {[], []}
-
-        policy ->
-          {struct_get(policy, :allowed_github_orgs) || [], struct_get(policy, :allowed_repos) || []}
-      end
+    repo_scope = repo_scope(binding)
 
     nodes = binding.nodes || %{}
     agents = binding.agents || %{}
@@ -277,13 +314,13 @@ defmodule SymphonyElixir.Binding do
     with :ok <- check_no_conflicts(issue_extracted.conflicts),
          :ok <- check_no_conflicts(project_extracted.conflicts),
          {:ok, project_vibe} <- ProjectVibeConfig.parse(Map.get(issue, :project_description)),
-         :ok <- validate_project_vibe(project_vibe, allowed_orgs, allowed_repos, nodes, agents),
+         :ok <- validate_project_vibe(project_vibe, repo_scope, nodes, agents),
          :ok <- check_project_allowed(label_agent, project_vibe_field(project_vibe, :allowed_agents), :agent_not_allowed_by_project),
          :ok <- check_project_allowed(label_node, project_vibe_field(project_vibe, :allowed_nodes), :node_not_allowed_by_project),
          raw_repo = issue_extracted.repo || project_extracted.repo || project_vibe_field(project_vibe, :repo) || struct_get(defaults, :repo),
          raw_node = label_node || project_vibe_field(project_vibe, :default_node) || struct_get(defaults, :node),
          raw_agent = label_agent || project_vibe_field(project_vibe, :default_agent) || struct_get(defaults, :agent),
-         {:ok, repo_url} <- resolve_repo(raw_repo, allowed_orgs, allowed_repos),
+         {:ok, repo_url} <- resolve_repo(raw_repo, repo_scope),
          {:ok, node_name} <- resolve_node(raw_node, nodes),
          {:ok, agent_name} <- resolve_agent(raw_agent, node_name, nodes, agents),
          node_config = Map.get(nodes, node_name, %{}),
@@ -324,10 +361,10 @@ defmodule SymphonyElixir.Binding do
   # own (regardless of whether this particular issue ends up using it),
   # so misconfiguration is caught immediately instead of surfacing later
   # on a different issue.
-  defp validate_project_vibe(nil, _allowed_orgs, _allowed_repos, _nodes, _agents), do: :ok
+  defp validate_project_vibe(nil, _repo_scope, _nodes, _agents), do: :ok
 
-  defp validate_project_vibe(project_vibe, allowed_orgs, allowed_repos, nodes, agents) do
-    with :ok <- validate_project_repo(project_vibe.repo, allowed_orgs, allowed_repos),
+  defp validate_project_vibe(project_vibe, repo_scope, nodes, agents) do
+    with :ok <- validate_project_repo(project_vibe.repo, repo_scope),
          :ok <- validate_project_agent(project_vibe.default_agent, agents),
          :ok <- validate_project_node(project_vibe.default_node, nodes),
          :ok <- validate_project_default_agent_allowed(project_vibe.default_agent, project_vibe.allowed_agents),
@@ -336,10 +373,10 @@ defmodule SymphonyElixir.Binding do
     end
   end
 
-  defp validate_project_repo(nil, _allowed_orgs, _allowed_repos), do: :ok
+  defp validate_project_repo(nil, _repo_scope), do: :ok
 
-  defp validate_project_repo(repo, allowed_orgs, allowed_repos) do
-    case resolve_repo(repo, allowed_orgs, allowed_repos) do
+  defp validate_project_repo(repo, repo_scope) do
+    case resolve_repo(repo, repo_scope) do
       {:ok, _repo_url} -> :ok
       {:error, reason} -> {:error, {:invalid_project_repo, reason}}
     end
@@ -478,10 +515,10 @@ defmodule SymphonyElixir.Binding do
   # Private: repo resolution and validation
   # ---------------------------------------------------------------------------
 
-  defp resolve_repo(nil, _allowed_orgs, _allowed_repos), do: {:ok, nil}
-  defp resolve_repo("", _allowed_orgs, _allowed_repos), do: {:error, {:invalid_repo_label, "empty repo value"}}
+  defp resolve_repo(nil, _repo_scope), do: {:ok, nil}
+  defp resolve_repo("", _repo_scope), do: {:error, {:invalid_repo_label, "empty repo value"}}
 
-  defp resolve_repo(raw, allowed_orgs, allowed_repos) do
+  defp resolve_repo(raw, repo_scope) do
     cond do
       String.contains?(raw, "..") ->
         {:error, {:invalid_repo_label, "path traversal not allowed in repo"}}
@@ -502,7 +539,7 @@ defmodule SymphonyElixir.Binding do
         {:error, {:invalid_repo_label, "http:// not allowed — use https://github.com/"}}
 
       String.starts_with?(raw, "https://github.com/") ->
-        validate_github_url(raw, allowed_orgs, allowed_repos)
+        validate_github_url(raw, repo_scope)
 
       String.starts_with?(raw, "https://") ->
         {:error, {:invalid_repo_label, "only github.com repos are allowed: #{inspect(raw)}"}}
@@ -510,29 +547,20 @@ defmodule SymphonyElixir.Binding do
       Regex.match?(~r{^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$}, raw) ->
         # org/repo shorthand
         [org, repo_name] = String.split(raw, "/", parts: 2)
+        url = "https://github.com/#{org}/#{repo_name}"
 
-        with :ok <- validate_github_org(org, raw, allowed_orgs),
-             :ok <- validate_allowed_repo(repo_name, raw, allowed_repos) do
-          {:ok, "https://github.com/#{raw}"}
+        with :ok <- validate_repo_access(org, repo_name, url, raw, repo_scope) do
+          {:ok, url}
         end
 
       Regex.match?(~r{^[A-Za-z0-9_.-]+$}, raw) ->
-        # bare repo name — expand using the single allowed org
-        case allowed_orgs do
-          [org] ->
-            with :ok <- validate_allowed_repo(raw, raw, allowed_repos) do
-              {:ok, "https://github.com/#{org}/#{raw}"}
-            end
+        # bare repo name — expand using the single allowed org/owner
+        with {:ok, org} <- single_org_for_expansion(raw, repo_scope) do
+          url = "https://github.com/#{org}/#{raw}"
 
-          [] ->
-            {:error,
-             {:invalid_repo_label,
-              "no allowed_github_orgs configured to expand bare repo name #{inspect(raw)}"}}
-
-          orgs ->
-            {:error,
-             {:invalid_repo_label,
-              "ambiguous bare repo name #{inspect(raw)} — configure exactly one allowed_github_org (found: #{Enum.join(orgs, ", ")})"}}
+          with :ok <- validate_repo_access(org, raw, url, raw, repo_scope) do
+            {:ok, url}
+          end
         end
 
       true ->
@@ -540,11 +568,10 @@ defmodule SymphonyElixir.Binding do
     end
   end
 
-  defp validate_github_url(url, allowed_orgs, allowed_repos) do
+  defp validate_github_url(url, repo_scope) do
     case Regex.run(~r{^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)}, url) do
       [_, org, repo_name] ->
-        with :ok <- validate_github_org(org, url, allowed_orgs),
-             :ok <- validate_allowed_repo(repo_name, url, allowed_repos) do
+        with :ok <- validate_repo_access(org, repo_name, url, url, repo_scope) do
           {:ok, url}
         end
 
@@ -553,6 +580,45 @@ defmodule SymphonyElixir.Binding do
     end
   end
 
+  # An org/repo is allowed if it's covered by allowed_repo_prefixes (URL
+  # prefix match) or allowed_repo_owners (any repo under that owner) —
+  # either of these grants access without enumerating individual repo names.
+  # Otherwise, fall back to the original combo: the org must be in
+  # allowed_github_orgs (when configured) and the repo name must be in
+  # allowed_repos (when configured).
+  #
+  # When NO repo_policy lists are configured at all, every github.com repo
+  # is allowed (historical default). But once any list is configured, a repo
+  # that matches none of them is rejected — otherwise a policy that only sets
+  # allowed_repo_prefixes/allowed_repo_owners would silently allow everything
+  # else via the "empty allowed_github_orgs/allowed_repos = unrestricted"
+  # fallback.
+  defp validate_repo_access(org, repo_name, url, raw, repo_scope) do
+    cond do
+      matches_any_prefix?(url, repo_scope.allowed_repo_prefixes) ->
+        :ok
+
+      org in repo_scope.allowed_repo_owners ->
+        :ok
+
+      repo_scope.allowed_orgs != [] or repo_scope.allowed_repos != [] ->
+        with :ok <- validate_github_org(org, raw, repo_scope.allowed_orgs) do
+          validate_allowed_repo(repo_name, raw, repo_scope.allowed_repos)
+        end
+
+      repo_scope.allowed_repo_prefixes == [] and repo_scope.allowed_repo_owners == [] ->
+        :ok
+
+      true ->
+        {:error,
+         {:invalid_repo_label,
+          "repo #{inspect(url)} is not covered by allowed_repo_prefixes #{inspect(repo_scope.allowed_repo_prefixes)} or allowed_repo_owners #{inspect(repo_scope.allowed_repo_owners)} (from #{inspect(raw)})"}}
+    end
+  end
+
+  defp matches_any_prefix?(_url, []), do: false
+  defp matches_any_prefix?(url, prefixes), do: Enum.any?(prefixes, &String.starts_with?(url, &1))
+
   # Empty allowed_orgs list = no restriction
   defp validate_github_org(_org, _raw, []), do: :ok
 
@@ -560,9 +626,7 @@ defmodule SymphonyElixir.Binding do
     if Enum.member?(allowed_orgs, org) do
       :ok
     else
-      {:error,
-       {:invalid_repo_label,
-        "org #{inspect(org)} is not in allowed_github_orgs #{inspect(allowed_orgs)} (from #{inspect(raw)})"}}
+      {:error, {:invalid_repo_label, "org #{inspect(org)} is not in allowed_github_orgs #{inspect(allowed_orgs)} (from #{inspect(raw)})"}}
     end
   end
 
@@ -575,6 +639,31 @@ defmodule SymphonyElixir.Binding do
       :ok
     else
       {:error, {:unknown_repo, repo_name, raw, allowed_repos}}
+    end
+  end
+
+  # Bare repo names (e.g. `repo:fin_bot`) need a single org/owner to expand
+  # against — prefer allowed_github_orgs (the historical mechanism), falling
+  # back to allowed_repo_owners when exactly one is configured.
+  defp single_org_for_expansion(raw, repo_scope) do
+    case repo_scope.allowed_orgs do
+      [org] ->
+        {:ok, org}
+
+      [] ->
+        case repo_scope.allowed_repo_owners do
+          [org] ->
+            {:ok, org}
+
+          [] ->
+            {:error, {:invalid_repo_label, "no allowed_github_orgs configured to expand bare repo name #{inspect(raw)}"}}
+
+          owners ->
+            {:error, {:invalid_repo_label, "ambiguous bare repo name #{inspect(raw)} — configure exactly one allowed_github_org or allowed_repo_owner (found owners: #{Enum.join(owners, ", ")})"}}
+        end
+
+      orgs ->
+        {:error, {:invalid_repo_label, "ambiguous bare repo name #{inspect(raw)} — configure exactly one allowed_github_org (found: #{Enum.join(orgs, ", ")})"}}
     end
   end
 

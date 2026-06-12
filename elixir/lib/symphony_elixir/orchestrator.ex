@@ -275,6 +275,10 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Linear project slug missing in WORKFLOW.md")
         state
 
+      {:error, :missing_linear_team_key} ->
+        Logger.error("tracker.auto_discover_projects is enabled but tracker.team_key is missing in WORKFLOW.md")
+        state
+
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
@@ -1619,6 +1623,7 @@ defmodule SymphonyElixir.Orchestrator do
 
           true ->
             config = Config.settings!()
+
             SymphonyElixir.Codex.ExternalExecutor.send_approval(
               config.external.command,
               run_id,
@@ -1671,20 +1676,26 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
     {
-      Map.merge(running_entry, Map.merge(%{
-        last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
-        session_id: session_id_for_update(running_entry.session_id, update),
-        last_codex_event: event,
-        codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
-        codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
-        codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
-        codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
-        codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
-        codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
-        codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
-        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }, vibe_fields)),
+      Map.merge(
+        running_entry,
+        Map.merge(
+          %{
+            last_codex_timestamp: timestamp,
+            last_codex_message: summarize_codex_update(update),
+            session_id: session_id_for_update(running_entry.session_id, update),
+            last_codex_event: event,
+            codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
+            codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
+            codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
+            codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
+            codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
+            codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
+            codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+            turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
+          },
+          vibe_fields
+        )
+      ),
       token_delta
     }
   end
