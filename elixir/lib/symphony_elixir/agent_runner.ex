@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.{AppServer, ExternalExecutor}
-  alias SymphonyElixir.{Binding, Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Binding, Config, Linear.Issue, PromptBuilder, Redact, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -21,8 +21,9 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        redacted_reason = Redact.redact(reason)
+        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(redacted_reason)}")
+        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(redacted_reason)}"
     end
   end
 
@@ -55,13 +56,13 @@ defmodule SymphonyElixir.AgentRunner do
 
         {:ok, binding} ->
           Logger.error(
-            "Binding resolved without repo_url for #{issue_context(issue)}: #{inspect(binding)}"
+            "Binding resolved without repo_url for #{issue_context(issue)}: #{inspect(Redact.redact(binding))}"
           )
 
           {:error, {:missing_repo_url, binding}}
 
         {:error, reason} ->
-          Logger.error("Binding resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
+          Logger.error("Binding resolution failed for #{issue_context(issue)}: #{inspect(Redact.redact(reason))}")
           {:error, {:binding_resolution_failed, reason}}
       end
     else

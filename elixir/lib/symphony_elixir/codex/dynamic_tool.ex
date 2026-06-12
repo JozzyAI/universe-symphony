@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Redact
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
@@ -189,7 +190,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "Linear GraphQL request failed before receiving a successful response.",
-        "reason" => inspect(reason)
+        "reason" => inspect(Redact.redact(reason))
       }
     }
   end
@@ -198,7 +199,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "Linear GraphQL tool execution failed.",
-        "reason" => inspect(reason)
+        "reason" => inspect(Redact.redact(reason))
       }
     }
   end
