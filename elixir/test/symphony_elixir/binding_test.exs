@@ -72,8 +72,18 @@ defmodule SymphonyElixir.BindingTest do
 
     defaults = Map.get(spec, :defaults, %{})
     orgs = Map.get(spec, :allowed_github_orgs, ["JozzyAI"])
+    allowed_repos = Map.get(spec, :allowed_repos, [])
 
     orgs_yaml = Enum.map_join(orgs, "\n", &"      - #{&1}")
+
+    allowed_repos_yaml =
+      case allowed_repos do
+        [] ->
+          ""
+
+        repos ->
+          "    allowed_repos:\n" <> Enum.map_join(repos, "\n", &"      - #{&1}") <> "\n"
+      end
 
     defaults_repo = Map.get(defaults, :repo, "https://github.com/JozzyAI/fin_bot")
     defaults_node = Map.get(defaults, :node, "company-node")
@@ -84,7 +94,7 @@ defmodule SymphonyElixir.BindingTest do
       repo_policy:
         allowed_github_orgs:
     #{orgs_yaml}
-      nodes:
+    #{allowed_repos_yaml}  nodes:
     #{nodes_yaml}
       agents:
     #{agents_yaml}
@@ -105,6 +115,42 @@ defmodule SymphonyElixir.BindingTest do
         allowed_agents: ["mock", "claude-code"]
       }
     }
+  end
+
+  # Fixture matching the documented label vocabulary: agent:codex/claude-code/mock,
+  # repo:fin_bot/vibe_interface_cli/universe-symphony, node:joey-pc/company-node,
+  # with defaults of agent=codex, repo=fin_bot, node=joey-pc.
+  defp label_routing_nodes do
+    %{
+      "joey-pc" => %{
+        relay: "wss://vibe-relay.example.com",
+        token: "tok",
+        node_id: "node_f7cedd3b6590aff9",
+        allowed_agents: ["mock", "claude-code", "codex"]
+      },
+      "company-node" => %{
+        relay: "wss://vibe-relay.example.com",
+        token: "tok",
+        allowed_agents: ["mock", "claude-code", "codex"]
+      }
+    }
+  end
+
+  defp label_routing_settings do
+    settings_with_binding(%{
+      nodes: label_routing_nodes(),
+      agents: %{
+        "mock" => %{permission_mode: "default"},
+        "claude-code" => %{permission_mode: "unsafe-skip"},
+        "codex" => %{permission_mode: "default"}
+      },
+      allowed_repos: ["fin_bot", "vibe_interface_cli", "universe-symphony"],
+      defaults: %{
+        repo: "https://github.com/JozzyAI/fin_bot",
+        node: "joey-pc",
+        agent: "codex"
+      }
+    })
   end
 
   # ---------------------------------------------------------------------------
@@ -487,6 +533,163 @@ defmodule SymphonyElixir.BindingTest do
       assert resolved.agent == "claude-code"
       assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
       assert resolved.encrypt == true
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Label routing tests (agent:*, repo:*, node:* -> agent_kind/repo_url/node_id)
+  # ---------------------------------------------------------------------------
+
+  describe "resolve/2 — label routing" do
+    setup do
+      previous = System.get_env("SYMPHONY_NODE_ID")
+      System.delete_env("SYMPHONY_NODE_ID")
+      on_exit(fn -> restore_env("SYMPHONY_NODE_ID", previous) end)
+      :ok
+    end
+
+    test "no labels resolves to the configured defaults" do
+      settings = label_routing_settings()
+      {:ok, resolved} = Binding.resolve(issue(labels: []), settings)
+
+      assert resolved.agent == "codex"
+      assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
+      assert resolved.node == "joey-pc"
+      assert resolved.node_id == "node_f7cedd3b6590aff9"
+    end
+
+    test "agent:mock label overrides the default agent" do
+      settings = label_routing_settings()
+      {:ok, resolved} = Binding.resolve(issue(labels: ["agent:mock"]), settings)
+
+      assert resolved.agent == "mock"
+      assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
+      assert resolved.node == "joey-pc"
+    end
+
+    test "repo:vibe_interface_cli label overrides the default repo" do
+      settings = label_routing_settings()
+      {:ok, resolved} = Binding.resolve(issue(labels: ["repo:vibe_interface_cli"]), settings)
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/vibe_interface_cli"
+      assert resolved.agent == "codex"
+      assert resolved.node == "joey-pc"
+    end
+
+    test "node:company-node label overrides the default node" do
+      settings = label_routing_settings()
+      {:ok, resolved} = Binding.resolve(issue(labels: ["node:company-node"]), settings)
+
+      assert resolved.node == "company-node"
+      assert resolved.agent == "codex"
+      assert resolved.repo_url == "https://github.com/JozzyAI/fin_bot"
+    end
+
+    test "agent + repo + node labels together all resolve correctly" do
+      settings = label_routing_settings()
+
+      {:ok, resolved} =
+        Binding.resolve(
+          issue(labels: ["agent:claude-code", "repo:universe-symphony", "node:company-node"]),
+          settings
+        )
+
+      assert resolved.agent == "claude-code"
+      assert resolved.repo_url == "https://github.com/JozzyAI/universe-symphony"
+      assert resolved.node == "company-node"
+    end
+
+    test "two agent:* labels fail fast with a conflict, dispatch is not attempted" do
+      settings = label_routing_settings()
+
+      assert {:error, {:conflicting_labels, :agent, ["codex", "mock"]}} =
+               Binding.resolve(issue(labels: ["agent:codex", "agent:mock"]), settings)
+    end
+
+    test "two repo:* labels fail fast with a conflict, dispatch is not attempted" do
+      settings = label_routing_settings()
+
+      assert {:error, {:conflicting_labels, :repo, ["fin_bot", "vibe_interface_cli"]}} =
+               Binding.resolve(
+                 issue(labels: ["repo:fin_bot", "repo:vibe_interface_cli"]),
+                 settings
+               )
+    end
+
+    test "two node:* labels fail fast with a conflict, dispatch is not attempted" do
+      settings = label_routing_settings()
+
+      assert {:error, {:conflicting_labels, :node, ["joey-pc", "company-node"]}} =
+               Binding.resolve(issue(labels: ["node:joey-pc", "node:company-node"]), settings)
+    end
+
+    test "unknown agent:* label fails fast and never dispatches" do
+      settings = label_routing_settings()
+
+      assert {:error, {:unknown_agent, "gpt5", known}} =
+               Binding.resolve(issue(labels: ["agent:gpt5"]), settings)
+
+      assert "codex" in known
+      assert "mock" in known
+      assert "claude-code" in known
+    end
+
+    test "repo:* label naming a repo outside allowed_repos fails fast" do
+      settings = label_routing_settings()
+
+      assert {:error, {:unknown_repo, "some-other-repo", "some-other-repo", allowed}} =
+               Binding.resolve(issue(labels: ["repo:some-other-repo"]), settings)
+
+      assert "fin_bot" in allowed
+      assert "vibe_interface_cli" in allowed
+      assert "universe-symphony" in allowed
+    end
+
+    test "unknown node:* label fails fast and never dispatches" do
+      settings = label_routing_settings()
+
+      assert {:error, {:unknown_node, "gpu-cluster", known}} =
+               Binding.resolve(issue(labels: ["node:gpu-cluster"]), settings)
+
+      assert "joey-pc" in known
+      assert "company-node" in known
+    end
+
+    test "unknown agent:* label never silently falls back to the configured default agent" do
+      settings = label_routing_settings()
+
+      # defaults.agent is the valid "codex", but an explicit invalid agent
+      # label must still fail -- never silently substitute the default.
+      assert {:error, {:unknown_agent, "gpt5", _known}} =
+               Binding.resolve(issue(labels: ["agent:gpt5"]), settings)
+    end
+  end
+
+  describe "describe_error/1" do
+    test "conflicting_labels message names both offending labels" do
+      message = Binding.describe_error({:conflicting_labels, :agent, ["codex", "mock"]})
+
+      assert message =~ "agent:codex"
+      assert message =~ "agent:mock"
+      assert message =~ "conflicting"
+    end
+
+    test "unknown_agent message names the offending label and known agents" do
+      message = Binding.describe_error({:unknown_agent, "gpt5", ["codex", "mock", "claude-code"]})
+
+      assert message =~ "agent:gpt5"
+      assert message =~ "codex"
+    end
+
+    test "unknown_repo message names the offending label and allowed repos" do
+      message =
+        Binding.describe_error(
+          {:unknown_repo, "some-other-repo", "some-other-repo",
+           ["fin_bot", "vibe_interface_cli", "universe-symphony"]}
+        )
+
+      assert message =~ "some-other-repo"
+      assert message =~ "fin_bot"
     end
   end
 

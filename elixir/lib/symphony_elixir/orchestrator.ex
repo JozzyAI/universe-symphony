@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Binding, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -936,16 +936,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
-    recipient = self()
+    case validate_binding_for_dispatch(issue) do
+      :ok ->
+        recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
-      :no_worker_capacity ->
-        Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+        case select_worker_host(state, preferred_worker_host) do
+          :no_worker_capacity ->
+            Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+            state
+
+          worker_host ->
+            issue = maybe_advance_todo_to_in_progress(issue)
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Skipping dispatch for #{issue_context(issue)}; binding resolution failed: #{inspect(reason)}")
+
+        notify_issue_outcome(
+          issue,
+          "Symphony: " <> Binding.describe_error(reason) <> " Dispatch skipped — fix the issue's labels and move it back to Todo to retry.",
+          "Human Review"
+        )
+
         state
+        |> complete_issue(issue.id)
+        |> release_issue_claim(issue.id)
+    end
+  end
 
-      worker_host ->
-        issue = maybe_advance_todo_to_in_progress(issue)
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+  # Binding resolution is pure and side-effect-free, so it's safe to check
+  # before spawning the agent task. This turns label conflicts/unknown
+  # values into a one-shot "comment + Human Review" instead of the
+  # crash -> infinite-retry loop that `AgentRunner` would otherwise hit on
+  # every dispatch attempt.
+  defp validate_binding_for_dispatch(issue) do
+    config = Config.settings!()
+
+    if config.agent_kind == "vibe" do
+      case Binding.resolve(issue, config) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      :ok
     end
   end
 
