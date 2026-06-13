@@ -174,7 +174,7 @@ defmodule SymphonyElixir.Linear.Client do
   # Resolves which project(s) to poll, in priority order:
   #   1. tracker.project_slugs (explicit list)
   #   2. tracker.project_slug (legacy single-project config)
-  #   3. tracker.auto_discover_projects (queries Linear for Symphony-enabled
+  #   3. tracker.auto_discover_projects (queries Linear for all active
   #      projects under tracker.team_key)
   defp resolve_project_slugs(tracker) do
     cond do

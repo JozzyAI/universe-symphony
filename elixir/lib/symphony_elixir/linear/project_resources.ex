@@ -7,10 +7,9 @@ defmodule SymphonyElixir.Linear.ProjectResources do
   `project.externalLinks` GraphQL field). This module picks out GitHub
   repository links from that list.
 
-  This is a discovery/extraction helper only — it does not influence repo
-  binding yet. See `SymphonyElixir.Binding` for the current resolution order
-  and `docs/project-resources.md` for the intended future priority once a
-  Project GitHub resource link is wired into binding.
+  This is an extraction helper used by `SymphonyElixir.Binding` when resolving
+  an issue's repo binding — see `SymphonyElixir.Binding` for the full
+  resolution order and `docs/project-resources.md` for details.
   """
 
   @github_repo ~r{^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)}

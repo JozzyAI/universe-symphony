@@ -35,7 +35,16 @@ checks as the bare-name form above.
 Both `agent:`/`repo:`/`node:` (colon) and `agent/`/`repo/`/`node/` (slash)
 syntaxes are accepted. Labels may be set on the issue itself or on its
 project; issue labels take priority over project labels, which take priority
-over `binding.defaults`.
+over the project's GitHub "Resources" repo link, which takes priority over
+the project's `vibe:` block, which takes priority over `binding.defaults` —
+see `docs/project-resources.md` for the full repo resolution order.
+
+If no `repo:*` label, project Resources link, `vibe.repo`, or
+`binding.defaults.repo` resolves to a repo at all, dispatch fails fast with a
+comment asking for a repo binding and moves the issue to **Human Review** —
+Symphony never guesses a repo. This is how
+`tracker.auto_discover_projects: true` can watch every active Linear Project
+in a team even before it has a repo configured.
 
 ## Current defaults
 

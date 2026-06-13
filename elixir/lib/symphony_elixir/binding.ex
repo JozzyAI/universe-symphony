@@ -1,22 +1,33 @@
 defmodule SymphonyElixir.Binding do
   @moduledoc """
   Resolves repo/node/agent binding from Linear labels, the Linear project's
-  `vibe:` description block, and WORKFLOW.md config.
+  "Resources" (externalLinks), the project's `vibe:` description block, and
+  WORKFLOW.md config.
 
   Labels are parsed from issue labels and project labels. Resolution priority
   for each of `repo`/`node`/`agent`, highest first:
     1. Issue labels — `agent:*`/`repo:*`/`node:*` set directly on the issue.
     2. Project labels — the *same label vocabulary* (`agent:*`/`repo:*`/
        `node:*`), but applied as labels on the Linear *project* that the
-       issue belongs to. This is a distinct mechanism from #3 below — do
+       issue belongs to. This is a distinct mechanism from #3/#4 below — do
        not confuse "a label on the project" with "the project's
-       *description* text".
-    3. Linear project *description*'s `vibe:` block — project-level
+       *Resources*/*description* text".
+    3. Project "Resources" GitHub repo link (`repo` only) — a single
+       `https://github.com/<org>/<repo>` link in the Linear project's
+       Resources (the `project.externalLinks` GraphQL field), normalized by
+       `SymphonyElixir.Linear.ProjectResources.github_repo_urls/1`. This is
+       a structured signal and takes priority over the natural-language
+       `vibe:` block below. Like `vibe.repo`, an invalid (fails
+       `repo_policy`) or ambiguous (more than one GitHub repo link) Resources
+       link fails fast for every issue in the project rather than silently
+       falling through to a lower-priority source.
+    4. Linear project *description*'s `vibe:` block — project-level
        defaults (`repo`, `default_agent`, `default_node`, `encrypt`) and
        allow-lists (`allowed_agents`, `allowed_nodes`) parsed from a fenced
        ```yaml code block in the project's description/content. See
-       `SymphonyElixir.Linear.ProjectVibeConfig` for the exact format.
-    4. binding.defaults (WORKFLOW.md, global fallback)
+       `SymphonyElixir.Linear.ProjectVibeConfig` for the exact format. This
+       remains a backward-compatible advanced fallback.
+    5. binding.defaults (WORKFLOW.md, global fallback)
 
   Label syntax (colon and slash forms are both supported):
     repo:https://github.com/JozzyAI/fin_bot
@@ -32,9 +43,16 @@ defmodule SymphonyElixir.Binding do
   outside that same block's own `allowed_agents`/`allowed_nodes`),
   resolution fails fast rather than silently falling back to WORKFLOW
   defaults.
+
+  If no `repo` can be resolved from *any* of the above (no `repo:*` label,
+  Resources link, `vibe.repo`, or `binding.defaults.repo`), resolution fails
+  fast with `{:missing_binding, :repo, _}` rather than dispatching without a
+  repo. Callers (see `SymphonyElixir.Orchestrator`) turn this into a Linear
+  comment asking for a repo binding and move the issue to Human Review — no
+  workspace or run is started.
   """
 
-  alias SymphonyElixir.Linear.ProjectVibeConfig
+  alias SymphonyElixir.Linear.{ProjectResources, ProjectVibeConfig}
 
   @type label_tag :: {:repo, String.t()} | {:node, String.t()} | {:agent, String.t()} | :unknown
 
@@ -179,19 +197,6 @@ defmodule SymphonyElixir.Binding do
     do: %{allowed_orgs: [], allowed_repos: [], allowed_repo_prefixes: [], allowed_repo_owners: []}
 
   @doc """
-  Validate a repo reference (full GitHub URL, `org/repo`, or bare repo name)
-  against `settings.binding`'s `repo_policy`, returning the resolved
-  `https://github.com/...` URL (or `{:ok, nil}` for a `nil` repo).
-
-  Used by `SymphonyElixir.Linear.ProjectDiscovery` to validate a discovered
-  project's `vibe.repo` before treating that project as Symphony-enabled.
-  """
-  @spec validate_repo(String.t() | nil, struct()) :: {:ok, String.t() | nil} | {:error, term()}
-  def validate_repo(repo, settings) do
-    resolve_repo(repo, repo_scope(settings.binding))
-  end
-
-  @doc """
   Render an error returned by `resolve/2` as a short, human-readable
   sentence suitable for posting back to the Linear issue as a comment.
   """
@@ -217,6 +222,12 @@ defmodule SymphonyElixir.Binding do
     "Agent `#{name}` is not allowed on node `#{node_name}` (allowed agents on that node: #{Enum.join(allowed, ", ")})."
   end
 
+  def describe_error({:missing_binding, :repo, _detail}) do
+    "I found this project, but I cannot determine which GitHub repo it should use. " <>
+      "Add a GitHub repo link to the Linear Project's Resources, add a `repo:*` label " <>
+      "(on the issue or the project), or set `binding.defaults.repo` in WORKFLOW.md."
+  end
+
   def describe_error({:missing_binding, field, _detail}) do
     "No `#{field}:*` label found on this issue and no default `#{field}` is configured in WORKFLOW.md."
   end
@@ -239,6 +250,15 @@ defmodule SymphonyElixir.Binding do
 
   def describe_error({:invalid_project_repo, reason}) do
     "This project's `vibe.repo` is invalid: #{describe_error(reason)}"
+  end
+
+  def describe_error({:invalid_project_resource_repo, reason}) do
+    "This project's GitHub repo link (Resources) is invalid: #{describe_error(reason)}"
+  end
+
+  def describe_error({:ambiguous_project_resource_repo, repos}) do
+    "This project has #{length(repos)} GitHub repo links in its Resources (#{Enum.join(repos, ", ")}) — " <>
+      "expected exactly one. Remove the extra link(s), or set a `repo:*` label on the issue or project to disambiguate."
   end
 
   def describe_error({:invalid_project_default_agent, name, known}) do
@@ -315,9 +335,16 @@ defmodule SymphonyElixir.Binding do
          :ok <- check_no_conflicts(project_extracted.conflicts),
          {:ok, project_vibe} <- ProjectVibeConfig.parse(Map.get(issue, :project_description)),
          :ok <- validate_project_vibe(project_vibe, repo_scope, nodes, agents),
+         {:ok, project_resource_repo} <- resolve_project_resource_repo(Map.get(issue, :project_resources) || [], repo_scope),
          :ok <- check_project_allowed(label_agent, project_vibe_field(project_vibe, :allowed_agents), :agent_not_allowed_by_project),
          :ok <- check_project_allowed(label_node, project_vibe_field(project_vibe, :allowed_nodes), :node_not_allowed_by_project),
-         raw_repo = issue_extracted.repo || project_extracted.repo || project_vibe_field(project_vibe, :repo) || struct_get(defaults, :repo),
+         raw_repo =
+           issue_extracted.repo ||
+             project_extracted.repo ||
+             project_resource_repo ||
+             project_vibe_field(project_vibe, :repo) ||
+             struct_get(defaults, :repo),
+         :ok <- check_repo_present(raw_repo),
          raw_node = label_node || project_vibe_field(project_vibe, :default_node) || struct_get(defaults, :node),
          raw_agent = label_agent || project_vibe_field(project_vibe, :default_agent) || struct_get(defaults, :agent),
          {:ok, repo_url} <- resolve_repo(raw_repo, repo_scope),
@@ -381,6 +408,43 @@ defmodule SymphonyElixir.Binding do
       {:error, reason} -> {:error, {:invalid_project_repo, reason}}
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Private: project "Resources" (externalLinks) GitHub repo binding signal
+  # ---------------------------------------------------------------------------
+
+  # A project's GitHub "Resources" link is a structured repo-binding signal —
+  # see priority #3 in the moduledoc. Like `vibe.repo`, it's validated
+  # unconditionally (even if a higher-priority label ends up winning for this
+  # particular issue), so a misconfigured project's Resources link is caught
+  # immediately instead of surfacing later on a different issue.
+  defp resolve_project_resource_repo(project_resources, repo_scope) do
+    case ProjectResources.github_repo_urls(project_resources) do
+      [] ->
+        {:ok, nil}
+
+      [repo] ->
+        case resolve_repo(repo, repo_scope) do
+          {:ok, repo_url} -> {:ok, repo_url}
+          {:error, reason} -> {:error, {:invalid_project_resource_repo, reason}}
+        end
+
+      repos ->
+        {:error, {:ambiguous_project_resource_repo, repos}}
+    end
+  end
+
+  # No `repo:*` label, project Resources link, `vibe.repo`, or
+  # `binding.defaults.repo` resolved to a repo at all — fail fast rather than
+  # dispatching (or guessing) without one. See `{:missing_binding, :repo, _}`
+  # in `describe_error/1`.
+  defp check_repo_present(nil) do
+    {:error,
+     {:missing_binding, :repo,
+      "no repo:* label, project Resources GitHub link, vibe.repo, or binding.defaults.repo configured"}}
+  end
+
+  defp check_repo_present(_raw_repo), do: :ok
 
   defp validate_project_agent(nil, _agents), do: :ok
 
