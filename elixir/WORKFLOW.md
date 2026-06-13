@@ -2,7 +2,8 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: "test1-99c9f7e93c92"
+  team_key: JOZ
+  auto_discover_projects: true
   active_states:
     - Todo
     - In Progress
@@ -35,6 +36,7 @@ binding:
       - fin_bot
       - vibe_interface_cli
       - universe-symphony
+      - spendlens
 
   nodes:
     joey-pc:
