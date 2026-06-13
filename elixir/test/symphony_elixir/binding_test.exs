@@ -32,29 +32,13 @@ defmodule SymphonyElixir.BindingTest do
     settings
   end
 
-  defp issue(labels: labels) do
-    %SymphonyElixir.Linear.Issue{identifier: "TEST-1", labels: labels, project_labels: []}
-  end
-
-  defp issue(labels: labels, project_labels: plabels) do
-    %SymphonyElixir.Linear.Issue{identifier: "TEST-1", labels: labels, project_labels: plabels}
-  end
-
-  defp issue(labels: labels, project_description: description) do
+  defp issue(opts) do
     %SymphonyElixir.Linear.Issue{
       identifier: "TEST-1",
-      labels: labels,
-      project_labels: [],
-      project_description: description
-    }
-  end
-
-  defp issue(labels: labels, project_labels: plabels, project_description: description) do
-    %SymphonyElixir.Linear.Issue{
-      identifier: "TEST-1",
-      labels: labels,
-      project_labels: plabels,
-      project_description: description
+      labels: Keyword.fetch!(opts, :labels),
+      project_labels: Keyword.get(opts, :project_labels, []),
+      project_description: Keyword.get(opts, :project_description),
+      project_resources: Keyword.get(opts, :project_resources, [])
     }
   end
 
@@ -1063,6 +1047,196 @@ defmodule SymphonyElixir.BindingTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Project "Resources" (externalLinks) repo binding tests
+  # ---------------------------------------------------------------------------
+
+  describe "resolve/2 — project Resources (externalLinks) repo binding" do
+    setup do
+      previous = System.get_env("SYMPHONY_NODE_ID")
+      System.delete_env("SYMPHONY_NODE_ID")
+      on_exit(fn -> restore_env("SYMPHONY_NODE_ID", previous) end)
+      :ok
+    end
+
+    test "a project with exactly one allowed GitHub Resources link resolves that repo and can dispatch" do
+      settings = label_routing_settings()
+
+      {:ok, resolved} =
+        Binding.resolve(
+          issue(labels: [], project_resources: ["https://github.com/JozzyAI/vibe_interface_cli"]),
+          settings
+        )
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/vibe_interface_cli"
+      assert resolved.agent == "codex"
+      assert resolved.node == "joey-pc"
+    end
+
+    test "issue repo:* label overrides the project Resources link" do
+      settings = label_routing_settings()
+
+      {:ok, resolved} =
+        Binding.resolve(
+          issue(
+            labels: ["repo:universe-symphony"],
+            project_resources: ["https://github.com/JozzyAI/vibe_interface_cli"]
+          ),
+          settings
+        )
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/universe-symphony"
+    end
+
+    test "project repo:* label overrides the project Resources link" do
+      settings = label_routing_settings()
+
+      {:ok, resolved} =
+        Binding.resolve(
+          issue(
+            labels: [],
+            project_labels: ["repo:universe-symphony"],
+            project_resources: ["https://github.com/JozzyAI/vibe_interface_cli"]
+          ),
+          settings
+        )
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/universe-symphony"
+    end
+
+    test "project Resources link overrides vibe.repo" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{repo: "fin_bot"})
+
+      {:ok, resolved} =
+        Binding.resolve(
+          issue(
+            labels: [],
+            project_description: description,
+            project_resources: ["https://github.com/JozzyAI/vibe_interface_cli"]
+          ),
+          settings
+        )
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/vibe_interface_cli"
+    end
+
+    test "vibe.repo still resolves the repo when there is no project Resources link (backward compatible)" do
+      settings = label_routing_settings()
+
+      description = project_description_with_vibe(%{repo: "vibe_interface_cli"})
+
+      {:ok, resolved} =
+        Binding.resolve(issue(labels: [], project_description: description, project_resources: []), settings)
+
+      assert resolved.repo_url == "https://github.com/JozzyAI/vibe_interface_cli"
+    end
+
+    test "a project with multiple GitHub repo Resources links fails fast instead of guessing" do
+      settings = label_routing_settings()
+
+      assert {:error, {:ambiguous_project_resource_repo, repos}} =
+               Binding.resolve(
+                 issue(
+                   labels: [],
+                   project_resources: [
+                     "https://github.com/JozzyAI/fin_bot",
+                     "https://github.com/JozzyAI/vibe_interface_cli"
+                   ]
+                 ),
+                 settings
+               )
+
+      assert "https://github.com/JozzyAI/fin_bot" in repos
+      assert "https://github.com/JozzyAI/vibe_interface_cli" in repos
+    end
+
+    test "a project Resources link outside repo_policy fails fast instead of dispatching" do
+      settings = label_routing_settings()
+
+      assert {:error, {:invalid_project_resource_repo, {:unknown_repo, "spendlens", _raw, allowed}}} =
+               Binding.resolve(
+                 issue(labels: [], project_resources: ["https://github.com/JozzyAI/spendlens"]),
+                 settings
+               )
+
+      assert "fin_bot" in allowed
+    end
+
+    test "invalid project Resources link fails fast even when an issue repo:* label would otherwise win" do
+      settings = label_routing_settings()
+
+      assert {:error, {:invalid_project_resource_repo, {:unknown_repo, "spendlens", _raw, allowed}}} =
+               Binding.resolve(
+                 issue(
+                   labels: ["repo:fin_bot"],
+                   project_resources: ["https://github.com/JozzyAI/spendlens"]
+                 ),
+                 settings
+               )
+
+      assert "fin_bot" in allowed
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # No repo source at all — fail fast rather than guess
+  # ---------------------------------------------------------------------------
+
+  describe "resolve/2 — no repo source resolves at all" do
+    setup do
+      previous = System.get_env("SYMPHONY_NODE_ID")
+      System.delete_env("SYMPHONY_NODE_ID")
+      on_exit(fn -> restore_env("SYMPHONY_NODE_ID", previous) end)
+      :ok
+    end
+
+    # binding.defaults has no `repo:` key (omitted from the hand-written YAML
+    # below), and the issue has no repo:* label, project repo:* label,
+    # project Resources link, or vibe.repo — nothing resolves to a repo.
+    test "issue in a project with no repo:* label, Resources link, vibe.repo, or binding.defaults.repo fails fast" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        agent_kind: "vibe",
+        binding: """
+        binding:
+          repo_policy:
+            allowed_github_orgs:
+              - JozzyAI
+          nodes:
+            company-node:
+              relay: "wss://r.example.com"
+              token: "t"
+              node_id: "node_company_abc123"
+              allowed_agents:
+                - mock
+                - claude-code
+          agents:
+            mock:
+              permission_mode: "default"
+            claude-code:
+              permission_mode: "unsafe-skip"
+          defaults:
+            node: "company-node"
+            agent: "claude-code"
+            encrypt: true
+        """
+      )
+
+      {:ok, %{config: config}} = Workflow.load()
+      {:ok, settings} = SymphonyElixir.Config.Schema.parse(config)
+
+      assert {:error, {:missing_binding, :repo, _detail}} =
+               Binding.resolve(issue(labels: []), settings)
+
+      message = Binding.describe_error({:missing_binding, :repo, "no repo:* label, project Resources GitHub link, vibe.repo, or binding.defaults.repo configured"})
+
+      assert message =~ "cannot determine which GitHub repo"
+      assert message =~ "Resources"
+      assert message =~ "repo:*"
+    end
+  end
+
   describe "describe_error/1" do
     test "conflicting_labels message names both offending labels" do
       message = Binding.describe_error({:conflicting_labels, :agent, ["codex", "mock"]})
@@ -1093,6 +1267,41 @@ defmodule SymphonyElixir.BindingTest do
 
       assert message =~ "vibe.repo"
       assert message =~ "some-other-repo"
+    end
+
+    test "missing_binding :repo message asks for a repo binding without guessing" do
+      message =
+        Binding.describe_error(
+          {:missing_binding, :repo, "no repo:* label, project Resources GitHub link, vibe.repo, or binding.defaults.repo configured"}
+        )
+
+      assert message =~ "cannot determine which GitHub repo"
+      assert message =~ "Resources"
+      assert message =~ "repo:*"
+      assert message =~ "binding.defaults.repo"
+    end
+
+    test "invalid_project_resource_repo message names the Resources link and the offending reason" do
+      message =
+        Binding.describe_error(
+          {:invalid_project_resource_repo, {:unknown_repo, "spendlens", "https://github.com/JozzyAI/spendlens", ["fin_bot"]}}
+        )
+
+      assert message =~ "Resources"
+      assert message =~ "spendlens"
+    end
+
+    test "ambiguous_project_resource_repo message lists every repo link found" do
+      message =
+        Binding.describe_error(
+          {:ambiguous_project_resource_repo,
+           ["https://github.com/JozzyAI/fin_bot", "https://github.com/JozzyAI/vibe_interface_cli"]}
+        )
+
+      assert message =~ "2 GitHub repo links"
+      assert message =~ "https://github.com/JozzyAI/fin_bot"
+      assert message =~ "https://github.com/JozzyAI/vibe_interface_cli"
+      assert message =~ "expected exactly one"
     end
 
     test "invalid_project_default_agent message names vibe.default_agent and known agents" do

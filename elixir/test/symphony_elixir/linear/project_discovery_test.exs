@@ -54,9 +54,7 @@ defmodule SymphonyElixir.Linear.ProjectDiscoveryTest do
         "id" => "project-id",
         "name" => "Project",
         "slugId" => "project-slug",
-        "state" => "started",
-        "description" => nil,
-        "content" => nil
+        "state" => "started"
       },
       attrs
     )
@@ -91,55 +89,121 @@ defmodule SymphonyElixir.Linear.ProjectDiscoveryTest do
   end
 
   # ---------------------------------------------------------------------------
-  # auto_discover_projects: true
+  # auto_discover_projects: false — explicit configured project only
   # ---------------------------------------------------------------------------
 
-  describe "discover_projects/0 — auto_discover_projects" do
-    test "discovers Symphony-enabled projects under the configured team" do
+  describe "discover_projects/0 — auto_discover_projects: false" do
+    test "Client.resolve_project_slugs_for_test uses only the explicitly configured project, never calling discovery" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_project_slug: "spendlens",
+        tracker_project_slugs: [],
+        tracker_team_key: "JOZ",
+        tracker_auto_discover_projects: false
+      )
+
+      # No graphql result configured at all — if discovery were invoked, the
+      # FakeTeamProjectsClient would return `nil` and resolution would crash.
+      config = SymphonyElixir.Config.settings!()
+
+      assert {:ok, ["spendlens"]} = Client.resolve_project_slugs_for_test(config.tracker)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # auto_discover_projects: true — scope-only discovery
+  # ---------------------------------------------------------------------------
+
+  describe "discover_projects/0 — auto_discover_projects: true (scope-only)" do
+    test "discovers every active project under the configured team, regardless of vibe:/externalLinks/labels" do
       configure_auto_discovery()
 
       set_graphql_result(
         {:ok,
          team_projects_body([
            project_node(%{
-             "id" => "proj-spendlens",
-             "name" => "spendlens",
-             "slugId" => "spendlens-abc123",
+             "id" => "proj-plain",
+             "name" => "plain-project",
+             "slugId" => "plain-slug",
+             "state" => "started"
+           }),
+           project_node(%{
+             "id" => "proj-with-link",
+             "name" => "linked-project",
+             "slugId" => "linked-slug",
              "state" => "started",
-             "description" => vibe_description("  repo: https://github.com/JozzyAI/spendlens")
+             "externalLinks" => %{"nodes" => [%{"url" => "https://github.com/JozzyAI/spendlens", "label" => nil}]}
+           }),
+           project_node(%{
+             "id" => "proj-with-vibe",
+             "name" => "vibe-only-project",
+             "slugId" => "vibe-only-slug",
+             "state" => "backlog",
+             "description" => vibe_description("  repo: https://github.com/JozzyAI/fin_bot")
            })
          ])}
       )
 
       log =
         capture_log(fn ->
-          assert {:ok, [project]} = ProjectDiscovery.discover_projects()
-          assert project.id == "proj-spendlens"
-          assert project.slug_id == "spendlens-abc123"
-          assert project.name == "spendlens"
-          assert project.repo == "https://github.com/JozzyAI/spendlens"
-          assert project.vibe.repo == "https://github.com/JozzyAI/spendlens"
+          assert {:ok, projects} = ProjectDiscovery.discover_projects()
+          slug_ids = Enum.map(projects, & &1.slug_id)
+
+          assert "plain-slug" in slug_ids
+          assert "linked-slug" in slug_ids
+          assert "vibe-only-slug" in slug_ids
+          assert length(projects) == 3
+
+          assert Enum.all?(projects, fn project -> Enum.sort(Map.keys(project)) == [:id, :name, :slug_id] end)
         end)
 
       assert log =~ "discovered project"
-      assert log =~ "spendlens-abc123"
-      assert log =~ "https://github.com/JozzyAI/spendlens"
+      assert log =~ "plain-slug"
+      assert log =~ "linked-slug"
+      assert log =~ "vibe-only-slug"
     end
 
-    test "ignores projects without a vibe: block" do
+    test "a project with no externalLinks at all is still discovered" do
       configure_auto_discovery()
 
       set_graphql_result(
         {:ok,
          team_projects_body([
-           project_node(%{"description" => "Just a normal project description, no config block."})
+           project_node(%{
+             "id" => "proj-no-links",
+             "name" => "no-links-project",
+             "slugId" => "no-links-slug",
+             "state" => "started"
+           })
          ])}
       )
 
-      assert {:ok, []} = ProjectDiscovery.discover_projects()
+      assert {:ok, [project]} = ProjectDiscovery.discover_projects()
+      assert project.id == "proj-no-links"
+      assert project.slug_id == "no-links-slug"
+      assert project.name == "no-links-project"
     end
 
-    test "ignores completed and canceled projects" do
+    test "a project with only a vibe: block and no GitHub externalLink is still discovered" do
+      configure_auto_discovery()
+
+      set_graphql_result(
+        {:ok,
+         team_projects_body([
+           project_node(%{
+             "id" => "proj-vibe-only",
+             "name" => "vibe-only-project",
+             "slugId" => "vibe-only-slug",
+             "state" => "started",
+             "description" => vibe_description("  repo: https://github.com/JozzyAI/spendlens")
+           })
+         ])}
+      )
+
+      assert {:ok, [project]} = ProjectDiscovery.discover_projects()
+      assert project.slug_id == "vibe-only-slug"
+    end
+
+    test "ignores completed and canceled projects regardless of vibe/externalLinks" do
       configure_auto_discovery()
 
       set_graphql_result(
@@ -149,18 +213,24 @@ defmodule SymphonyElixir.Linear.ProjectDiscoveryTest do
              "id" => "proj-done",
              "slugId" => "done-slug",
              "state" => "completed",
-             "description" => vibe_description("  repo: https://github.com/JozzyAI/done-project")
+             "externalLinks" => %{"nodes" => [%{"url" => "https://github.com/JozzyAI/done-project", "label" => nil}]}
            }),
            project_node(%{
              "id" => "proj-cancel",
              "slugId" => "cancel-slug",
              "state" => "canceled",
              "description" => vibe_description("  repo: https://github.com/JozzyAI/cancel-project")
+           }),
+           project_node(%{
+             "id" => "proj-active",
+             "slugId" => "active-slug",
+             "state" => "started"
            })
          ])}
       )
 
-      assert {:ok, []} = ProjectDiscovery.discover_projects()
+      assert {:ok, [project]} = ProjectDiscovery.discover_projects()
+      assert project.slug_id == "active-slug"
     end
 
     test "returns an error when team_key is not configured" do
@@ -169,181 +239,45 @@ defmodule SymphonyElixir.Linear.ProjectDiscoveryTest do
       assert {:error, :missing_linear_team_key} = ProjectDiscovery.discover_projects()
     end
 
-    test "Client.resolve_project_slugs_for_test maps discovered projects to slugIds" do
+    test "Client.resolve_project_slugs_for_test maps every discovered project to its slugId" do
       configure_auto_discovery()
 
       set_graphql_result(
         {:ok,
          team_projects_body([
-           project_node(%{
-             "id" => "proj-spendlens",
-             "name" => "spendlens",
-             "slugId" => "spendlens-abc123",
-             "description" => vibe_description("  repo: https://github.com/JozzyAI/spendlens")
-           }),
-           project_node(%{"id" => "proj-other", "name" => "other", "description" => nil})
+           project_node(%{"id" => "proj-a", "name" => "a", "slugId" => "a-slug", "state" => "started"}),
+           project_node(%{"id" => "proj-b", "name" => "b", "slugId" => "b-slug", "state" => "planned"})
          ])}
       )
 
       config = SymphonyElixir.Config.settings!()
 
-      assert {:ok, ["spendlens-abc123"]} = Client.resolve_project_slugs_for_test(config.tracker)
+      assert {:ok, slug_ids} = Client.resolve_project_slugs_for_test(config.tracker)
+      assert "a-slug" in slug_ids
+      assert "b-slug" in slug_ids
+      assert length(slug_ids) == 2
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Malformed vibe: blocks
+  # GraphQL error handling
   # ---------------------------------------------------------------------------
 
-  describe "discover_projects/0 — malformed project description" do
-    test "logs a warning and skips a project with an invalid vibe: field, without crashing the poller" do
+  describe "discover_projects/0 — GraphQL error handling" do
+    test "returns an error when the team is not found" do
       configure_auto_discovery()
 
-      set_graphql_result({:ok,
-       team_projects_body([
-         project_node(%{
-           "id" => "proj-bad",
-           "name" => "bad-config",
-           "slugId" => "bad-config-slug",
-           # allowed_agents must be a list, not a scalar.
-           "description" => vibe_description("  allowed_agents: codex")
-         }),
-         project_node(%{
-           "id" => "proj-good",
-           "name" => "good-config",
-           "slugId" => "good-config-slug",
-           "description" => vibe_description("  repo: https://github.com/JozzyAI/good-config")
-         })
-       ])})
+      set_graphql_result({:ok, %{"data" => %{"team" => nil}}})
 
-      log =
-        capture_log(fn ->
-          assert {:ok, [project]} = ProjectDiscovery.discover_projects()
-          assert project.slug_id == "good-config-slug"
-        end)
-
-      assert log =~ "malformed vibe config"
-      assert log =~ "bad-config"
+      assert {:error, :linear_team_not_found} = ProjectDiscovery.discover_projects()
     end
 
-    test "a vibe: value that is not a mapping is logged and skipped" do
+    test "returns an error when the GraphQL response contains errors" do
       configure_auto_discovery()
 
-      set_graphql_result(
-        {:ok,
-         team_projects_body([
-           project_node(%{
-             "id" => "proj-scalar",
-             "name" => "scalar-vibe",
-             "slugId" => "scalar-vibe-slug",
-             "description" => """
-             ```yaml
-             vibe: not-a-map
-             ```
-             """
-           })
-         ])}
-      )
+      set_graphql_result({:ok, %{"errors" => [%{"message" => "boom"}]}})
 
-      log =
-        capture_log(fn ->
-          assert {:ok, []} = ProjectDiscovery.discover_projects()
-        end)
-
-      assert log =~ "malformed vibe config"
-      assert log =~ "scalar-vibe"
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # repo_policy.allowed_repo_prefixes / allowed_repo_owners
-  # ---------------------------------------------------------------------------
-
-  describe "discover_projects/0 — repo allowlist (prefixes/owners)" do
-    test "discovers a project whose vibe.repo matches an allowed_repo_prefix" do
-      configure_auto_discovery(binding: %{repo_policy: %{allowed_repo_prefixes: ["https://github.com/JozzyAI/"]}})
-
-      set_graphql_result(
-        {:ok,
-         team_projects_body([
-           project_node(%{
-             "id" => "proj-spendlens",
-             "name" => "spendlens",
-             "slugId" => "spendlens-abc123",
-             "description" => vibe_description("  repo: https://github.com/JozzyAI/spendlens")
-           })
-         ])}
-      )
-
-      assert {:ok, [project]} = ProjectDiscovery.discover_projects()
-      assert project.repo == "https://github.com/JozzyAI/spendlens"
-    end
-
-    test "discovers a project whose vibe.repo matches an allowed_repo_owner" do
-      configure_auto_discovery(binding: %{repo_policy: %{allowed_repo_owners: ["JozzyAI"]}})
-
-      set_graphql_result(
-        {:ok,
-         team_projects_body([
-           project_node(%{
-             "id" => "proj-spendlens",
-             "name" => "spendlens",
-             "slugId" => "spendlens-abc123",
-             "description" => vibe_description("  repo: https://github.com/JozzyAI/spendlens")
-           })
-         ])}
-      )
-
-      assert {:ok, [project]} = ProjectDiscovery.discover_projects()
-      assert project.repo == "https://github.com/JozzyAI/spendlens"
-    end
-
-    test "logs invalid_project_repo and skips a project whose vibe.repo is outside allowed_repo_prefixes" do
-      configure_auto_discovery(binding: %{repo_policy: %{allowed_repo_prefixes: ["https://github.com/JozzyAI/"]}})
-
-      set_graphql_result(
-        {:ok,
-         team_projects_body([
-           project_node(%{
-             "id" => "proj-evil",
-             "name" => "evil-project",
-             "slugId" => "evil-slug",
-             "description" => vibe_description("  repo: https://github.com/evil-org/malware")
-           })
-         ])}
-      )
-
-      log =
-        capture_log(fn ->
-          assert {:ok, []} = ProjectDiscovery.discover_projects()
-        end)
-
-      assert log =~ "invalid_project_repo"
-      assert log =~ "evil-project"
-    end
-
-    test "logs invalid_project_repo and skips a project whose vibe.repo is outside allowed_repo_owners" do
-      configure_auto_discovery(binding: %{repo_policy: %{allowed_repo_owners: ["JozzyAI"]}})
-
-      set_graphql_result(
-        {:ok,
-         team_projects_body([
-           project_node(%{
-             "id" => "proj-evil",
-             "name" => "evil-project",
-             "slugId" => "evil-slug",
-             "description" => vibe_description("  repo: https://github.com/evil-org/malware")
-           })
-         ])}
-      )
-
-      log =
-        capture_log(fn ->
-          assert {:ok, []} = ProjectDiscovery.discover_projects()
-        end)
-
-      assert log =~ "invalid_project_repo"
-      assert log =~ "evil-project"
+      assert {:error, {:linear_graphql_errors, [%{"message" => "boom"}]}} = ProjectDiscovery.discover_projects()
     end
   end
 end
