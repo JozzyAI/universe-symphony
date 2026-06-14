@@ -147,6 +147,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_continuation_attempts, :integer, default: 1)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:max_active_runs_per_project, :integer)
+      field(:max_active_runs_per_repo, :integer)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -159,7 +161,9 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_continuation_attempts,
-          :max_concurrent_agents_by_state
+          :max_concurrent_agents_by_state,
+          :max_active_runs_per_project,
+          :max_active_runs_per_repo
         ],
         empty_values: []
       )
@@ -167,6 +171,8 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:max_continuation_attempts, greater_than: 0)
+      |> validate_number(:max_active_runs_per_project, greater_than: 0)
+      |> validate_number(:max_active_runs_per_repo, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end

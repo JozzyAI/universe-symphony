@@ -33,6 +33,7 @@ defmodule SymphonyElixir.Linear.Client do
           }
         }
         project {
+          id
           description
           content
           labels {
@@ -93,6 +94,7 @@ defmodule SymphonyElixir.Linear.Client do
           }
         }
         project {
+          id
           description
           content
           labels {
@@ -526,6 +528,7 @@ defmodule SymphonyElixir.Linear.Client do
       project_labels: extract_project_labels(issue),
       project_description: extract_project_description(issue),
       project_resources: extract_project_resources(issue),
+      project_id: extract_project_id(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
@@ -612,6 +615,11 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_project_labels(_), do: []
+
+  # The Linear project's internal id, used to group issues by Linear project
+  # for the `agent.max_active_runs_per_project` concurrency guard.
+  defp extract_project_id(%{"project" => %{"id" => id}}) when is_binary(id), do: id
+  defp extract_project_id(_), do: nil
 
   # The `vibe:` project-binding block is typically written into the
   # project's longer "content" document, but fall back to the shorter
