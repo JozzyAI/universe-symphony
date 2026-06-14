@@ -20,6 +20,8 @@ workspace:
 agent:
   max_concurrent_agents: 4
   max_turns: 20
+  max_active_runs_per_project: 1
+  max_active_runs_per_repo: 1
 agent_kind: vibe
 external:
   command: vibe

@@ -118,6 +118,8 @@ defmodule SymphonyElixir.TestSupport do
           max_retry_backoff_ms: 300_000,
           max_continuation_attempts: 1,
           max_concurrent_agents_by_state: %{},
+          max_active_runs_per_project: nil,
+          max_active_runs_per_repo: nil,
           agent_kind: "codex",
           repo_url: nil,
           repo_branch_prefix: nil,
@@ -166,6 +168,8 @@ defmodule SymphonyElixir.TestSupport do
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_continuation_attempts = Keyword.get(config, :max_continuation_attempts)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    max_active_runs_per_project = Keyword.get(config, :max_active_runs_per_project)
+    max_active_runs_per_repo = Keyword.get(config, :max_active_runs_per_repo)
     agent_kind = Keyword.get(config, :agent_kind)
     repo_url = Keyword.get(config, :repo_url)
     repo_branch_prefix = Keyword.get(config, :repo_branch_prefix)
@@ -217,6 +221,8 @@ defmodule SymphonyElixir.TestSupport do
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_continuation_attempts: #{yaml_value(max_continuation_attempts)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        "  max_active_runs_per_project: #{yaml_value(max_active_runs_per_project)}",
+        "  max_active_runs_per_repo: #{yaml_value(max_active_runs_per_repo)}",
         "agent_kind: #{yaml_value(agent_kind)}",
         repo_yaml(repo_url, repo_branch_prefix),
         binding_yaml(binding),

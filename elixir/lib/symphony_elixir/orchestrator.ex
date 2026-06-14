@@ -376,7 +376,14 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
-    should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+    should_dispatch_issue_for_test(issue, state, [])
+  end
+
+  @doc false
+  @spec should_dispatch_issue_for_test(Issue.t(), term(), [Issue.t()]) :: boolean()
+  def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state, other_issues)
+      when is_list(other_issues) do
+    should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set(), other_issues)
   end
 
   @doc false
@@ -784,7 +791,7 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states, issues) do
         dispatch_issue(state_acc, issue)
       else
         state_acc
@@ -816,7 +823,8 @@ defmodule SymphonyElixir.Orchestrator do
          %Issue{} = issue,
          %State{running: running, claimed: claimed, blocked: blocked} = state,
          active_states,
-         terminal_states
+         terminal_states,
+         other_issues
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
@@ -825,10 +833,11 @@ defmodule SymphonyElixir.Orchestrator do
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      worker_slots_available?(state) and
+      project_repo_slots_available?(issue, state, other_issues)
   end
 
-  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states, _other_issues), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -848,6 +857,97 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         false
     end)
+  end
+
+  # Project/repo concurrency guard (agent.max_active_runs_per_project /
+  # agent.max_active_runs_per_repo). Skips the check entirely when both
+  # limits are unset, preserving prior dispatch behavior. An issue that is
+  # skipped here stays in its current state (e.g. Todo) and is picked up on
+  # a later poll once the other active issue leaves the active state.
+  defp project_repo_slots_available?(%Issue{} = issue, %State{} = state, other_issues) do
+    config = Config.settings!()
+    project_limit = config.agent.max_active_runs_per_project
+    repo_limit = config.agent.max_active_runs_per_repo
+
+    if is_nil(project_limit) and is_nil(repo_limit) do
+      true
+    else
+      others = other_active_issues(issue, state, other_issues)
+
+      cond do
+        not project_slot_available?(issue, others, project_limit) ->
+          Logger.debug("Project concurrency limit reached for #{issue_context(issue)}; leaving in current state for later pickup")
+          false
+
+        not repo_slot_available?(issue, others, repo_limit, config) ->
+          Logger.debug("Repo concurrency limit reached for #{issue_context(issue)}; leaving in current state for later pickup")
+          false
+
+        true ->
+          true
+      end
+    end
+  end
+
+  # "Active" issues other than the candidate: issues Symphony currently has
+  # running or claimed-but-blocked, plus any issue visible in this poll that
+  # is already in a non-Todo active state (e.g. In Progress, Merging) even
+  # if Symphony isn't currently tracking it (e.g. after a restart).
+  defp other_active_issues(%Issue{id: issue_id}, %State{running: running, blocked: blocked}, other_issues) do
+    active_states = active_state_set()
+
+    symphony_owned =
+      (Map.values(running) ++ Map.values(blocked))
+      |> Enum.map(&Map.get(&1, :issue))
+      |> Enum.filter(&is_struct(&1, Issue))
+
+    visibly_active =
+      Enum.filter(other_issues, fn
+        %Issue{state: state_name} when is_binary(state_name) ->
+          normalize_issue_state(state_name) != "todo" and
+            active_issue_state?(state_name, active_states)
+
+        _ ->
+          false
+      end)
+
+    (symphony_owned ++ visibly_active)
+    |> Enum.reject(fn %Issue{id: id} -> id == issue_id end)
+    |> Enum.uniq_by(& &1.id)
+  end
+
+  defp project_slot_available?(_issue, _others, nil), do: true
+  defp project_slot_available?(%Issue{project_id: nil}, _others, _limit), do: true
+
+  defp project_slot_available?(%Issue{project_id: project_id}, others, limit) when is_integer(limit) do
+    count = Enum.count(others, &(&1.project_id == project_id))
+    count < limit
+  end
+
+  defp repo_slot_available?(_issue, _others, nil, _config), do: true
+
+  defp repo_slot_available?(%Issue{} = issue, others, limit, config) when is_integer(limit) do
+    case resolve_repo_url(issue, config) do
+      nil ->
+        true
+
+      repo_url ->
+        count = Enum.count(others, &(resolve_repo_url(&1, config) == repo_url))
+        count < limit
+    end
+  end
+
+  # Binding resolution is pure and side-effect-free (see
+  # `validate_binding_for_dispatch/1`), so it's safe to call here for every
+  # candidate/other issue on every poll. Resolution failures are treated as
+  # "unknown repo" (the concurrency check is skipped for that issue) — the
+  # existing binding validation in `do_dispatch_issue/4` independently
+  # handles failures for the dispatched issue itself.
+  defp resolve_repo_url(%Issue{} = issue, config) do
+    case Binding.resolve(issue, config) do
+      {:ok, %{repo_url: repo_url}} when is_binary(repo_url) and repo_url != "" -> repo_url
+      _ -> nil
+    end
   end
 
   defp candidate_issue?(
