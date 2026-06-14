@@ -412,6 +412,12 @@ defmodule SymphonyElixir.Orchestrator do
     maybe_advance_todo_to_in_progress(issue)
   end
 
+  @doc false
+  @spec choose_issues_for_test([Issue.t()], term()) :: term()
+  def choose_issues_for_test(issues, %State{} = state) when is_list(issues) do
+    choose_issues(issues, state)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
