@@ -407,5 +407,37 @@ defmodule SymphonyElixir.OrchestratorPlannerDispatchTest do
       assert_receive {:memory_tracker_state_update, _issue_id, "Human Review"}
       assert_receive {:planner_done, _issue_id}
     end
+
+    test "6. the same issue is not dispatched twice across two consecutive polls before PlannerRunner finishes" do
+      write_planner_workflow!()
+
+      issue = plan_issue()
+      put_memory_tracker_issue(issue)
+      state = %Orchestrator.State{}
+
+      state_after_poll_1 = Orchestrator.choose_issues_for_test([issue], state)
+      assert MapSet.equal?(state_after_poll_1.claimed, MapSet.new([issue.id]))
+
+      # Poll 2 sees the same Todo-turned-In-Progress issue again before
+      # PlannerRunner finishes and releases the claim via :planner_done.
+      state_after_poll_2 = Orchestrator.choose_issues_for_test([issue], state_after_poll_1)
+
+      assert MapSet.equal?(state_after_poll_2.claimed, MapSet.new([issue.id]))
+      assert state_after_poll_2.running == %{}
+
+      assert_receive {:memory_tracker_state_update, issue_id, "In Progress"}
+      assert issue_id == issue.id
+      refute_received {:memory_tracker_state_update, _issue_id, "In Progress"}
+
+      assert_receive {:executor_run_called, _issue, _prompt, _workspace, _opts}
+      refute_receive {:executor_run_called, _issue, _prompt, _workspace, _opts}, 200
+
+      # Drain the rest of poll 1's run so the spawned Task doesn't outlive the
+      # test and race with a later test's Application env changes.
+      assert_receive {:create_issue_called, _attrs}
+      assert_receive {:memory_tracker_comment, _issue_id, _comment}
+      assert_receive {:memory_tracker_state_update, _issue_id, "Human Review"}
+      assert_receive {:planner_done, _issue_id}
+    end
   end
 end
