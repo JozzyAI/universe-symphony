@@ -7,6 +7,15 @@ defmodule SymphonyElixir.Planner.Runner do
   extracts the proposed child issue specs, creates them as child Linear
   issues, and moves the parent to Human Review.
 
+  Node/relay/token routing is resolved via `SymphonyElixir.Binding.resolve/2`
+  — the same shared resolution `AgentRunner` uses for coding dispatch — so
+  the planner agent (`planner.agent`, e.g. `codex`) is dispatched to whatever
+  node actually advertises it, rather than always falling back to the local
+  node registry. Only `binding.node_id`/`relay`/`token`/`encrypt` are reused
+  this way; `repo_url` from the binding is used solely as an informational
+  note in generated child issue descriptions and is never passed to the
+  executor.
+
   This module never writes code, opens pull requests, or merges anything —
   it only creates Linear issues and posts/transitions on the parent issue.
   Every step is best-effort and idempotent: a `<!-- symphony-planner:v1 -->`
@@ -134,37 +143,40 @@ defmodule SymphonyElixir.Planner.Runner do
   defp execute_plan(issue, existing_children) do
     config = Config.settings!()
     planner_config = config.planner
-    repo_url = resolve_repo_url(issue, config)
-    prompt = build_prompt(issue, repo_url)
 
-    case run_planner_executor(issue, prompt, config) do
-      {:ok, output} ->
-        case PlanExtractor.extract_plan(output) do
-          {:ok, %{children: children}} ->
-            if length(children) > planner_config.max_children do
-              fail_run(issue, {:too_many_children, length(children), planner_config.max_children})
-            else
-              create_children(issue, children, existing_children, repo_url, planner_config)
+    case Binding.resolve(issue, config) do
+      {:ok, binding} ->
+        repo_url = binding_repo_url(binding)
+        prompt = build_prompt(issue, repo_url)
+
+        case run_planner_executor(issue, prompt, config, binding) do
+          {:ok, output} ->
+            case PlanExtractor.extract_plan(output) do
+              {:ok, %{children: children}} ->
+                if length(children) > planner_config.max_children do
+                  fail_run(issue, {:too_many_children, length(children), planner_config.max_children})
+                else
+                  create_children(issue, children, existing_children, repo_url, planner_config)
+                end
+
+              {:error, reason} ->
+                fail_run(issue, {:plan_extraction_failed, reason})
             end
 
           {:error, reason} ->
-            fail_run(issue, {:plan_extraction_failed, reason})
+            fail_run(issue, {:executor_failed, reason})
         end
 
       {:error, reason} ->
-        fail_run(issue, {:executor_failed, reason})
+        fail_run(issue, {:binding_resolution_failed, reason})
     end
   end
 
-  # Binding resolution is pure/side-effect-free, so it's safe to call here
-  # purely to surface a "repo binding note" in child descriptions — this is
-  # informational only and never used to set up a coding workspace.
-  defp resolve_repo_url(issue, config) do
-    case Binding.resolve(issue, config) do
-      {:ok, %{repo_url: repo_url}} when is_binary(repo_url) and repo_url != "" -> repo_url
-      _ -> nil
-    end
-  end
+  # `binding.repo_url` is used only to surface a "repo binding note" in child
+  # descriptions — it is informational and never passed to the executor (the
+  # planner never sets up a coding workspace).
+  defp binding_repo_url(%{repo_url: repo_url}) when is_binary(repo_url) and repo_url != "", do: repo_url
+  defp binding_repo_url(_binding), do: nil
 
   defp build_prompt(issue, repo_url) do
     Prompt.build(%{
@@ -182,14 +194,20 @@ defmodule SymphonyElixir.Planner.Runner do
   # the safe/default permission mode regardless of the configured agent
   # permission mode (this run never writes code).
   #
+  # `node`/`relay`/`token`/`encrypt` are taken from the resolved `binding` —
+  # the same node/relay routing AgentRunner uses for coding dispatch — so a
+  # planner agent that's only advertised by a relay-paired remote node (e.g.
+  # `codex`) is dispatched to that node instead of silently falling back to
+  # the local node registry.
+  #
   # `agent: config.planner.agent` (default "codex") is used instead of
-  # `config.external.agent` (default "mock") — the mock backend's canned
-  # simulation always emits an `approval_required` event partway through,
-  # which would make every planner run fail. `deny_pending_approvals: true`
-  # is a backstop: if the planner turn nonetheless requests file-modification
-  # approval, ExternalExecutor denies it and stops the run instead of leaving
-  # it pending.
-  defp run_planner_executor(issue, prompt, config) do
+  # `binding.agent`/`config.external.agent` (default "mock") — the mock
+  # backend's canned simulation always emits an `approval_required` event
+  # partway through, which would make every planner run fail.
+  # `deny_pending_approvals: true` is a backstop: if the planner turn
+  # nonetheless requests file-modification approval, ExternalExecutor denies
+  # it and stops the run instead of leaving it pending.
+  defp run_planner_executor(issue, prompt, config, binding) do
     {:ok, output_agent} = Agent.start_link(fn -> [] end)
 
     on_message = fn
@@ -205,10 +223,10 @@ defmodule SymphonyElixir.Planner.Runner do
       executor_module().run(issue, prompt, nil,
         command: config.external.command,
         agent: config.planner.agent,
-        node: config.external.node,
-        relay: config.external.relay,
-        token: config.external.token,
-        encrypt: config.external.encrypt,
+        node: binding.node_id,
+        relay: binding.relay,
+        token: binding.token,
+        encrypt: binding.encrypt,
         repo_url: nil,
         permission_mode: "default",
         deny_pending_approvals: true,
@@ -371,6 +389,8 @@ defmodule SymphonyElixir.Planner.Runner do
     "Symphony Planner could not finish planning this issue: #{describe_failure(reason)}\n\n" <>
       "Moved to Human Review — fix the issue and move it back to Todo to retry."
   end
+
+  defp describe_failure({:binding_resolution_failed, reason}), do: Binding.describe_error(reason)
 
   defp describe_failure({:executor_failed, reason}), do: "the planner run failed (#{inspect(reason)})"
 

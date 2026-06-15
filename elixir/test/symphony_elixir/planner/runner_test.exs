@@ -381,4 +381,150 @@ defmodule SymphonyElixir.Planner.RunnerTest do
     assert_receive {:create_issue_called, attrs}
     assert attrs.description =~ "Repo binding: https://github.com/acme/widgets"
   end
+
+  # ── Remote node/relay/token routing (binding-resolved, not local) ────────
+  #
+  # These mirror the live binding shape: `binding.defaults.node: "joey-pc"`,
+  # `binding.nodes.joey-pc.node_id: "node_f7cedd3b6590aff9"` (plus
+  # relay/token), and `binding.agents.codex.permission_mode: "unsafe-skip"`.
+  # The planner must resolve `node_id`/`relay`/`token`/`encrypt` from this
+  # binding (not fall back to the local node registry) while still hardcoding
+  # `permission_mode: "default"` and `repo_url: nil` for its own executor
+  # call, independent of `binding.agent`/`binding.permission_mode`.
+  describe "remote node/relay/token routing" do
+    setup do
+      previous_node_id = System.get_env("SYMPHONY_NODE_ID")
+      System.delete_env("SYMPHONY_NODE_ID")
+      on_exit(fn -> restore_env("SYMPHONY_NODE_ID", previous_node_id) end)
+      :ok
+    end
+
+    test "passes the resolved remote node id, relay, token, encrypt, repo_url nil, permission_mode default, deny_pending_approvals true, and a repo binding note" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        planner_enabled: true,
+        planner_trigger_label: "type:plan",
+        planner_child_initial_state: "Backlog",
+        planner_max_children: 10,
+        planner_agent: "codex",
+        binding: remote_binding_yaml()
+      )
+
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Only child title"])})
+
+      issue = parent_issue()
+
+      assert {:ok, {:created_children, [_identifier]}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:executor_run_called, _issue, _prompt, workspace, opts}
+      assert workspace == nil
+      assert Keyword.get(opts, :agent) == "codex"
+      assert Keyword.get(opts, :node) == "node_f7cedd3b6590aff9"
+      assert Keyword.get(opts, :relay) == "wss://relay.example.com"
+      assert Keyword.get(opts, :token) == "tok-secret-123"
+      assert Keyword.get(opts, :encrypt) == true
+      assert Keyword.get(opts, :repo_url) == nil
+      assert Keyword.get(opts, :permission_mode) == "default"
+      assert Keyword.get(opts, :deny_pending_approvals) == true
+
+      assert_receive {:create_issue_called, attrs}
+      assert attrs.description =~ "Repo binding: https://github.com/acme/widgets"
+    end
+
+    test "a binding with no configured node_id (and no SYMPHONY_NODE_ID) fails safely: parent moves to Human Review with no executor call and no children" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        planner_enabled: true,
+        planner_trigger_label: "type:plan",
+        planner_child_initial_state: "Backlog",
+        planner_max_children: 10,
+        planner_agent: "codex",
+        binding: remote_binding_yaml(node_id: nil)
+      )
+
+      issue = parent_issue()
+
+      assert {:ok, {:failed, {:binding_resolution_failed, {:missing_node_id, "joey-pc"}}}} =
+               Runner.run(issue, recipient: self())
+
+      refute_receive {:executor_run_called, _issue, _prompt, _workspace, _opts}
+      refute_receive {:create_issue_called, _attrs}
+
+      assert_receive {:memory_tracker_comment, "parent-1", comment}
+      assert comment =~ "could not finish planning"
+      refute comment =~ "<!-- symphony-planner:v1"
+
+      assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
+      assert_receive {:planner_done, "parent-1"}
+    end
+
+    test "an agent_not_supported executor failure on the resolved remote node fails safely with no retry and no children" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        planner_enabled: true,
+        planner_trigger_label: "type:plan",
+        planner_child_initial_state: "Backlog",
+        planner_max_children: 10,
+        planner_agent: "codex",
+        binding: remote_binding_yaml()
+      )
+
+      Application.put_env(
+        :symphony_elixir,
+        :fake_executor_result,
+        {:error,
+         {:start_failed, 1,
+          ~s({"error":true,"code":"agent_not_supported","message":"Node node_f7cedd3b6590aff9 does not support agent codex"}\n)}}
+      )
+
+      issue = parent_issue()
+
+      assert {:ok, {:failed, {:executor_failed, {:start_failed, 1, _output}}}} = Runner.run(issue, recipient: self())
+
+      refute_receive {:create_issue_called, _attrs}
+
+      assert_receive {:memory_tracker_comment, "parent-1", comment}
+      assert comment =~ "could not finish planning"
+
+      assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
+      assert_receive {:planner_done, "parent-1"}
+    end
+  end
+
+  # Mirrors the live `binding:` shape used in WORKFLOW.md: `defaults.node`
+  # points at a node entry that carries `node_id`/`relay`/`token` (the
+  # relay-paired remote node), and `agents.codex.permission_mode` is
+  # deliberately *not* "default" so tests can confirm the planner doesn't
+  # pick it up.
+  defp remote_binding_yaml(opts \\ []) do
+    node_id_line =
+      case Keyword.get(opts, :node_id, "node_f7cedd3b6590aff9") do
+        nil -> []
+        node_id -> ["      node_id: \"#{node_id}\""]
+      end
+
+    [
+      "binding:",
+      "  defaults:",
+      "    repo: \"https://github.com/acme/widgets\"",
+      "    node: \"joey-pc\"",
+      "    agent: \"codex\"",
+      "    encrypt: true",
+      "  nodes:",
+      "    joey-pc:"
+    ]
+    |> Kernel.++(node_id_line)
+    |> Kernel.++([
+      "      relay: \"wss://relay.example.com\"",
+      "      token: \"tok-secret-123\"",
+      "      allowed_agents:",
+      "        - mock",
+      "        - claude-code",
+      "        - codex",
+      "  agents:",
+      "    codex:",
+      "      permission_mode: \"unsafe-skip\""
+    ])
+    |> Enum.join("\n")
+  end
 end
