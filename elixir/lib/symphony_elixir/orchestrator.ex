@@ -220,6 +220,11 @@ defmodule SymphonyElixir.Orchestrator do
 
         finish_issue_with_pr(state, issue_id, running_entry, pr_url)
 
+      agent_kind_vibe?() ->
+        Logger.warning("Agent task completed without a PR for issue_id=#{issue_id} session_id=#{session_id}; moving to Human Review to avoid duplicate Vibe dispatch")
+
+        finish_issue_without_pr(state, issue_id, running_entry.issue, "agent run completed without a pull request.")
+
       continuation_attempts_exhausted?(running_entry) ->
         Logger.warning("Agent task completed without a PR for issue_id=#{issue_id} session_id=#{session_id} after exhausting continuation attempts")
 
@@ -241,10 +246,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
-    else
-      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    cond do
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
+
+      agent_kind_vibe?() ->
+        Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; moving to Human Review to avoid duplicate Vibe dispatch")
+
+        finish_issue_without_pr(state, issue_id, running_entry.issue, "agent run exited unexpectedly (#{inspect(reason)}).")
+
+      true ->
+        retry_agent_down(state, issue_id, running_entry, session_id, reason)
     end
   end
 
@@ -652,16 +664,26 @@ defmodule SymphonyElixir.Orchestrator do
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, error)
       else
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+        if agent_kind_vibe?() do
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; moving to Human Review to avoid duplicate Vibe dispatch")
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+          issue = running_entry.issue
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> finish_issue_without_pr(issue_id, issue, "agent run stalled for #{elapsed_ms}ms without activity.")
+        else
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+
+          next_attempt = next_retry_attempt_from_running(running_entry)
+
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> schedule_issue_retry(issue_id, next_attempt, %{
+            identifier: identifier,
+            error: "stalled for #{elapsed_ms}ms without codex activity"
+          })
+        end
       end
     else
       state
@@ -1284,13 +1306,18 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
-        next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
-        schedule_issue_retry(state, issue.id, next_attempt, %{
-          identifier: issue.identifier,
-          error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
-        })
+        if agent_kind_vibe?() do
+          finish_issue_without_pr(state, issue.id, issue, "failed to start agent run (#{inspect(reason)}).")
+        else
+          next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+          schedule_issue_retry(state, issue.id, next_attempt, %{
+            identifier: issue.identifier,
+            error: "failed to spawn agent: #{inspect(reason)}",
+            worker_host: worker_host
+          })
+        end
     end
   end
 
@@ -1348,6 +1375,36 @@ defmodule SymphonyElixir.Orchestrator do
     notify_issue_outcome(
       running_entry.issue,
       "Symphony: agent run completed without a pull request after #{attempts} attempt(s). Pausing automatic retries — moved to Human Review for manual follow-up.",
+      "Human Review"
+    )
+
+    state
+    |> complete_issue(issue_id)
+    |> release_issue_claim(issue_id)
+  end
+
+  defp agent_kind_vibe? do
+    Config.settings!().agent_kind == "vibe"
+  end
+
+  # Vibe dispatches are single-shot (PromptBuilder always renders "turn 1 of
+  # 1" for agent_kind: "vibe", and ExternalExecutor cannot reliably stop a
+  # prior `vibe symphony start` run on every exit path). Re-entering
+  # `schedule_issue_retry` -> `handle_active_retry` -> `dispatch_issue` for
+  # such an issue can therefore spawn a second concurrent `vibe symphony
+  # start` for the same issue/workspace while the first one is still running
+  # (the JOZ-23 duplicate-dispatch bug), because that path bypasses the
+  # `claimed`/`running` checks in `should_dispatch_issue?/5`.
+  #
+  # So for agent_kind: "vibe", any run that ends without a PR (no-PR
+  # completion, crash, stall timeout, or failed start) is treated as terminal:
+  # comment + move to Human Review, then release the claim for good. A human
+  # moves the issue back to Todo to retry once any in-flight Vibe run has
+  # finished.
+  defp finish_issue_without_pr(%State{} = state, issue_id, %Issue{} = issue, reason_text) do
+    notify_issue_outcome(
+      issue,
+      "Symphony: #{reason_text} To avoid duplicate Vibe dispatch, automatic retries are disabled for this issue — moved to Human Review for manual follow-up. Move back to Todo to retry once any in-progress Vibe run for this issue has finished.",
       "Human Review"
     )
 
