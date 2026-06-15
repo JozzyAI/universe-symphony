@@ -20,7 +20,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   | status:running    | (ignored)             | Informational — run already started         |
   | log               | :output               | message, stream fields                      |
   | tool_call         | :tool_call            | tool and input fields                       |
-  | approval_required | :approval_required    | approval_id, message — then returns blocked |
+  | approval_required | :approval_required    | approval_id, message — then returns blocked; if `deny_pending_approvals: true` was passed to `run/4`, also denies the approval (when relay/token configured) and stops the run |
   | approval_response | :approval_response    | approval_id, decision — non-blocking        |
   | pr_created        | :pr_created           | url — non-blocking                          |
   | status:blocked    | :vibe_blocked         | then returns {:error, {:blocked, ...}}      |
@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   alias SymphonyElixir.Linear.Issue
 
   @port_line_bytes 65_536
+  @plan_only_deny_message "Symphony Planner runs are plan-only and must not modify files; denying automatically."
 
   @spec run(Issue.t(), String.t(), Path.t(), keyword()) :: :ok | {:error, term()}
   def run(issue, prompt, _workspace, opts \\ []) do
@@ -48,6 +49,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     encrypt = Keyword.get(opts, :encrypt)
     repo_url = Keyword.get(opts, :repo_url)
     permission_mode = Keyword.get(opts, :permission_mode)
+    deny_pending_approvals = Keyword.get(opts, :deny_pending_approvals, false)
 
     prompt_file = write_temp_prompt!(prompt, issue)
 
@@ -62,7 +64,8 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
           timestamp: DateTime.utc_now(),
         })
 
-        stream_run(command, run_meta.run_id, relay, token, on_message)
+        ctx = %{command: command, relay: relay, token: token, deny_pending_approvals: deny_pending_approvals}
+        stream_run(ctx, run_meta.run_id, on_message)
       end
     after
       File.rm(prompt_file)
@@ -116,15 +119,15 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     end
   end
 
-  defp stream_run(command, run_id, relay, token, on_message) do
-    case resolve_executable(command) do
+  defp stream_run(ctx, run_id, on_message) do
+    case resolve_executable(ctx.command) do
       nil ->
-        {:error, {:command_not_found, command}}
+        {:error, {:command_not_found, ctx.command}}
 
       executable ->
         stream_args =
           ["symphony", "stream", run_id, "--jsonl"]
-          |> append_relay_stream_args(relay, token)
+          |> append_relay_stream_args(ctx.relay, ctx.token)
 
         port =
           Port.open(
@@ -137,33 +140,33 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
             ]
           )
 
-        Logger.info("ExternalExecutor: streaming run_id=#{run_id} relay=#{inspect(relay)}")
-        await_stream(port, run_id, command, relay, token, on_message)
+        Logger.info("ExternalExecutor: streaming run_id=#{run_id} relay=#{inspect(ctx.relay)}")
+        await_stream(port, run_id, ctx, on_message)
     end
   end
 
-  defp await_stream(port, run_id, command, relay, token, on_message) do
+  defp await_stream(port, run_id, ctx, on_message) do
     receive do
       {^port, {:data, {:eol, line}}} ->
         case Jason.decode(line) do
-          {:ok, event} -> handle_event(event, port, run_id, command, relay, token, on_message)
-          {:error, _} -> await_stream(port, run_id, command, relay, token, on_message)
+          {:ok, event} -> handle_event(event, port, run_id, ctx, on_message)
+          {:error, _} -> await_stream(port, run_id, ctx, on_message)
         end
 
       {^port, {:data, {:noeol, _partial}}} ->
-        await_stream(port, run_id, command, relay, token, on_message)
+        await_stream(port, run_id, ctx, on_message)
 
       {^port, {:exit_status, 0}} ->
         {:error, :stream_ended_without_terminal}
 
       {^port, {:exit_status, code}} ->
         Logger.warning("ExternalExecutor: stream crashed code=#{code} run_id=#{run_id}")
-        stop_run(command, run_id, relay, token)
+        stop_run(ctx.command, run_id, ctx.relay, ctx.token)
         {:error, {:stream_crashed, code}}
     end
   end
 
-  defp handle_event(%{"type" => "status", "status" => "completed"}, port, run_id, _command, _relay, _token, _on_message) do
+  defp handle_event(%{"type" => "status", "status" => "completed"}, port, run_id, _ctx, _on_message) do
     Logger.info("ExternalExecutor: completed run_id=#{run_id}")
     close_port(port)
     :ok
@@ -173,9 +176,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
          %{"type" => "status", "status" => terminal} = event,
          port,
          run_id,
-         _command,
-         _relay,
-         _token,
+         _ctx,
          _on_message
        )
        when terminal in ["failed", "stopped", "cancelled"] do
@@ -184,14 +185,14 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     {:error, {String.to_atom(terminal), event}}
   end
 
-  defp handle_event(%{"type" => "status", "status" => "blocked"} = event, port, run_id, _command, _relay, _token, on_message) do
+  defp handle_event(%{"type" => "status", "status" => "blocked"} = event, port, run_id, _ctx, on_message) do
     Logger.info("ExternalExecutor: blocked run_id=#{run_id}")
     on_message.(%{event: :vibe_blocked, raw: event, timestamp: DateTime.utc_now()})
     close_port(port)
     {:error, {:blocked, :status_blocked, event}}
   end
 
-  defp handle_event(%{"type" => "log", "message" => message} = event, port, run_id, command, relay, token, on_message) do
+  defp handle_event(%{"type" => "log", "message" => message} = event, port, run_id, ctx, on_message) do
     on_message.(%{
       event: :output,
       message: message,
@@ -199,10 +200,10 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
       raw: event,
       timestamp: DateTime.utc_now()
     })
-    await_stream(port, run_id, command, relay, token, on_message)
+    await_stream(port, run_id, ctx, on_message)
   end
 
-  defp handle_event(%{"type" => "tool_call", "tool" => tool} = event, port, run_id, command, relay, token, on_message) do
+  defp handle_event(%{"type" => "tool_call", "tool" => tool} = event, port, run_id, ctx, on_message) do
     on_message.(%{
       event: :tool_call,
       tool: tool,
@@ -210,23 +211,29 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
       raw: event,
       timestamp: DateTime.utc_now()
     })
-    await_stream(port, run_id, command, relay, token, on_message)
+    await_stream(port, run_id, ctx, on_message)
   end
 
-  defp handle_event(%{"type" => "approval_required"} = event, port, run_id, _command, _relay, _token, on_message) do
-    Logger.info("ExternalExecutor: approval_required run_id=#{run_id} approval_id=#{Map.get(event, "approval_id")}")
+  defp handle_event(%{"type" => "approval_required"} = event, port, run_id, ctx, on_message) do
+    approval_id = Map.get(event, "approval_id")
+    Logger.info("ExternalExecutor: approval_required run_id=#{run_id} approval_id=#{approval_id}")
     on_message.(%{
       event: :approval_required,
-      approval_id: Map.get(event, "approval_id"),
+      approval_id: approval_id,
       message: Map.get(event, "message"),
       raw: event,
       timestamp: DateTime.utc_now()
     })
     close_port(port)
+
+    if ctx.deny_pending_approvals do
+      deny_and_stop(ctx, run_id, approval_id)
+    end
+
     {:error, {:blocked, :approval_required, event}}
   end
 
-  defp handle_event(%{"type" => "approval_response"} = event, port, run_id, command, relay, token, on_message) do
+  defp handle_event(%{"type" => "approval_response"} = event, port, run_id, ctx, on_message) do
     on_message.(%{
       event: :approval_response,
       approval_id: Map.get(event, "approval_id"),
@@ -234,24 +241,44 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
       raw: event,
       timestamp: DateTime.utc_now()
     })
-    await_stream(port, run_id, command, relay, token, on_message)
+    await_stream(port, run_id, ctx, on_message)
   end
 
-  defp handle_event(%{"type" => "pr_created", "url" => url} = event, port, run_id, command, relay, token, on_message) do
+  defp handle_event(%{"type" => "pr_created", "url" => url} = event, port, run_id, ctx, on_message) do
     Logger.info("ExternalExecutor: pr_created run_id=#{run_id} url=#{url}")
     on_message.(%{event: :pr_created, url: url, raw: event, timestamp: DateTime.utc_now()})
-    await_stream(port, run_id, command, relay, token, on_message)
+    await_stream(port, run_id, ctx, on_message)
   end
 
-  defp handle_event(%{"type" => "error", "message" => message} = event, port, run_id, command, relay, token, _on_message) do
+  defp handle_event(%{"type" => "error", "message" => message} = event, port, run_id, ctx, _on_message) do
     Logger.warning("ExternalExecutor: error event run_id=#{run_id} message=#{message}")
     close_port(port)
-    stop_run(command, run_id, relay, token)
+    stop_run(ctx.command, run_id, ctx.relay, ctx.token)
     {:error, {:run_error, event}}
   end
 
-  defp handle_event(_unknown, port, run_id, command, relay, token, on_message) do
-    await_stream(port, run_id, command, relay, token, on_message)
+  defp handle_event(_unknown, port, run_id, ctx, on_message) do
+    await_stream(port, run_id, ctx, on_message)
+  end
+
+  # Plan-only safety net: if a planner-style run (which should never modify
+  # files) is asked for file-modification approval, deny it (when a relay is
+  # configured) and stop the run so it doesn't sit pending.
+  defp deny_and_stop(ctx, run_id, approval_id) do
+    if is_binary(approval_id) and is_binary(ctx.relay) and is_binary(ctx.token) do
+      case send_approval(ctx.command, run_id, approval_id, "deny", ctx.relay, ctx.token, @plan_only_deny_message) do
+        {:ok, _result} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "ExternalExecutor: failed to deny approval run_id=#{run_id} approval_id=#{approval_id}: #{inspect(reason)}"
+          )
+      end
+    end
+
+    stop_run(ctx.command, run_id, ctx.relay, ctx.token)
+    :ok
   end
 
   @spec send_approval(String.t(), String.t(), String.t(), String.t(), String.t() | nil, String.t() | nil, String.t() | nil) ::

@@ -131,6 +131,14 @@ defmodule SymphonyElixir.Planner.Prompt do
     """
     ## Instructions
 
+    This is a plan-only, read-only turn. You have no repository checkout and \
+    no coding workspace.
+
+    - Do not inspect, read, open, or search for any files.
+    - Do not modify, create, or delete any files.
+    - Do not call any tools (no shell, file, git, or other tool calls).
+    - Do not create git commits.
+    - Do not create or open pull requests.
     - Decompose the parent issue into 5 to 10 child issues.
     - Each child issue must be small enough to implement and review in a single pull request (PR-sized).
     - Each child issue must include clear, testable acceptance criteria.
@@ -139,7 +147,9 @@ defmodule SymphonyElixir.Planner.Prompt do
     - Do not include API keys, tokens, passwords, or other secrets anywhere in your output.
     - Do not claim that any work has already been done.
     - Do not create pull requests, and do not instruct anyone to merge a pull request.
-    - Do not output any prose, explanation, or commentary outside the final fenced JSON block.
+    - Respond with text only: your entire output must be your planning notes followed by exactly \
+    one fenced JSON code block, and nothing else. Do not output any prose, explanation, or \
+    commentary outside the final fenced JSON block.
     """
     |> String.trim_trailing()
   end

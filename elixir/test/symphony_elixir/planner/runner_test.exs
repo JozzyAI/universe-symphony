@@ -286,6 +286,44 @@ defmodule SymphonyElixir.Planner.RunnerTest do
     assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
   end
 
+  test "an approval_required executor failure moves the parent to Human Review with a non-idempotency failure comment and creates no children" do
+    Application.put_env(
+      :symphony_elixir,
+      :fake_executor_result,
+      {:error,
+       {:blocked, :approval_required,
+        %{"approval_id" => "appr-1", "message" => "Proceed with modifying tracked files?", "type" => "approval_required"}}}
+    )
+
+    issue = parent_issue()
+
+    assert {:ok, {:failed, {:executor_failed, {:blocked, :approval_required, _event}}}} = Runner.run(issue, recipient: self())
+
+    refute_receive {:create_issue_called, _attrs}
+
+    assert_receive {:memory_tracker_comment, "parent-1", comment}
+    assert comment =~ "could not finish planning"
+    refute comment =~ "<!-- symphony-planner:v1"
+
+    assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
+    assert_receive {:planner_done, "parent-1"}
+  end
+
+  test "runs the plan-only Codex turn with the planner's agent (independent of external.agent=mock), no repo_url/workspace, default permission mode, and deny_pending_approvals enabled" do
+    Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Only child title"])})
+
+    issue = parent_issue()
+
+    assert {:ok, {:created_children, [_identifier]}} = Runner.run(issue, recipient: self())
+
+    assert_receive {:executor_run_called, _issue, _prompt, workspace, opts}
+    assert workspace == nil
+    assert Keyword.get(opts, :agent) == "codex"
+    assert Keyword.get(opts, :repo_url) == nil
+    assert Keyword.get(opts, :permission_mode) == "default"
+    assert Keyword.get(opts, :deny_pending_approvals) == true
+  end
+
   test "more children than planner.max_children moves the parent to Human Review without creating any children" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
