@@ -285,6 +285,15 @@ defmodule SymphonyElixir.OrchestratorPlannerDispatchTest do
       assert_receive {:executor_run_called, run_issue, _prompt, _workspace, _opts}
       assert run_issue.id == issue.id
       assert run_issue.state == "In Progress"
+
+      # Drain the rest of this run so the spawned Task doesn't outlive the
+      # test and race with a later test's Application env changes (it would
+      # otherwise call the real Linear client once :linear_client_module is
+      # restored by another test's on_exit).
+      assert_receive {:create_issue_called, _attrs}
+      assert_receive {:memory_tracker_comment, _issue_id, _comment}
+      assert_receive {:memory_tracker_state_update, _issue_id, "Human Review"}
+      assert_receive {:planner_done, _issue_id}
     end
 
     test "does not spawn PlannerRunner when the Todo -> In Progress transition fails" do
@@ -388,6 +397,15 @@ defmodule SymphonyElixir.OrchestratorPlannerDispatchTest do
 
       assert_receive {:executor_run_called, _issue, _prompt, _workspace, _opts}
       refute_receive {:executor_run_called, _issue, _prompt, _workspace, _opts}, 200
+
+      # Drain the rest of this run so the spawned Task doesn't outlive the
+      # test and race with a later test's Application env changes (it would
+      # otherwise call the real Linear client once :linear_client_module is
+      # restored by another test's on_exit).
+      assert_receive {:create_issue_called, _attrs}
+      assert_receive {:memory_tracker_comment, _issue_id, _comment}
+      assert_receive {:memory_tracker_state_update, _issue_id, "Human Review"}
+      assert_receive {:planner_done, _issue_id}
     end
   end
 end
