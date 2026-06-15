@@ -90,6 +90,42 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     """)
   end
 
+  # Fake vibe that emits approval_required, and records `symphony stop` /
+  # `approval respond` invocations to `marker_path` (one line each).
+  defp vibe_blocked_recording!(marker_path) do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    case "$SUBCOMMAND-$ACTION" in
+      symphony-start)
+        echo '{"run_id":"blocked-run-1","session_id":"sess-blocked","node_id":"local","agent":"mock","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
+        ;;
+      symphony-stream)
+        RUN_ID="${3:-blocked-run-1}"
+        echo "{\\"type\\":\\"status\\",\\"status\\":\\"running\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:00Z\\"}"
+        echo "{\\"type\\":\\"approval_required\\",\\"approval_id\\":\\"appr-1\\",\\"message\\":\\"Proceed?\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:01Z\\"}"
+        ;;
+      symphony-stop)
+        echo "stop:${3:-blocked-run-1}" >> #{marker_path}
+        echo "{\\"run_id\\":\\"${3:-blocked-run-1}\\",\\"status\\":\\"stopped\\"}"
+        ;;
+      approval-respond)
+        DECISION=""
+        APPROVAL_ID=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --decision) shift; DECISION="$1" ;;
+            --approval-id) shift; APPROVAL_ID="$1" ;;
+          esac
+          shift
+        done
+        echo "deny:$APPROVAL_ID:$DECISION" >> #{marker_path}
+        echo "{\\"ok\\":true,\\"approval_id\\":\\"$APPROVAL_ID\\",\\"decision\\":\\"$DECISION\\"}"
+        ;;
+    esac
+    """)
+  end
+
   # Fake vibe that emits status:blocked
   defp vibe_status_blocked! do
     write_fake_vibe!(~s"""
@@ -257,6 +293,53 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     [{:approval_required, appr_event}] = :ets.lookup(received, :approval_required)
     assert appr_event.approval_id == "appr-1"
     assert appr_event.message == "Proceed?"
+  end
+
+  test "approval_required without deny_pending_approvals leaves the run alone (default/coding-agent behavior)" do
+    marker = Path.join(System.tmp_dir!(), "vibe-marker-#{System.unique_integer([:positive])}")
+    cmd = vibe_blocked_recording!(marker)
+    issue = fake_issue()
+
+    assert {:error, {:blocked, :approval_required, _event}} =
+             ExternalExecutor.run(issue, "do something", "/tmp", command: cmd, agent: "mock")
+
+    refute File.exists?(marker)
+  end
+
+  test "approval_required with deny_pending_approvals: true stops the run even without a relay" do
+    marker = Path.join(System.tmp_dir!(), "vibe-marker-#{System.unique_integer([:positive])}")
+    cmd = vibe_blocked_recording!(marker)
+    issue = fake_issue()
+
+    assert {:error, {:blocked, :approval_required, _event}} =
+             ExternalExecutor.run(issue, "do something", "/tmp",
+               command: cmd,
+               agent: "codex",
+               deny_pending_approvals: true
+             )
+
+    content = File.read!(marker)
+    assert content =~ "stop:blocked-run-1"
+    refute content =~ "deny:"
+  end
+
+  test "approval_required with deny_pending_approvals: true and a configured relay denies the approval and stops the run" do
+    marker = Path.join(System.tmp_dir!(), "vibe-marker-#{System.unique_integer([:positive])}")
+    cmd = vibe_blocked_recording!(marker)
+    issue = fake_issue()
+
+    assert {:error, {:blocked, :approval_required, _event}} =
+             ExternalExecutor.run(issue, "do something", "/tmp",
+               command: cmd,
+               agent: "codex",
+               relay: "ws://relay",
+               token: "tok",
+               deny_pending_approvals: true
+             )
+
+    content = File.read!(marker)
+    assert content =~ "deny:appr-1:deny"
+    assert content =~ "stop:blocked-run-1"
   end
 
   test "status:blocked returns blocked error with vibe_blocked event" do
@@ -441,5 +524,17 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     config = Config.settings!()
     assert config.external.command == "/usr/local/bin/vibe"
     assert config.external.agent == "claude-code"
+  end
+
+  test "planner.agent defaults to codex, independent of external.agent (mock)" do
+    config = Config.settings!()
+    assert config.planner.agent == "codex"
+    assert config.external.agent == "mock"
+  end
+
+  test "planner.agent reads from workflow file" do
+    write_workflow_file!(Workflow.workflow_file_path(), planner_agent: "claude-code")
+
+    assert Config.settings!().planner.agent == "claude-code"
   end
 end

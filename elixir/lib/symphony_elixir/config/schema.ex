@@ -395,12 +395,17 @@ defmodule SymphonyElixir.Config.Schema do
       field(:trigger_label, :string, default: "type:plan")
       field(:child_initial_state, :string, default: "Backlog")
       field(:max_children, :integer, default: 10)
+      # Agent backend for the plan-only Codex turn (no repo_url, no workspace).
+      # Deliberately independent of external.agent (which defaults to "mock"
+      # for the coding-agent dispatch path) so the planner always gets a real
+      # planning turn instead of the mock CLI simulation.
+      field(:agent, :string, default: "codex")
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:enabled, :trigger_label, :child_initial_state, :max_children], empty_values: [])
+      |> cast(attrs, [:enabled, :trigger_label, :child_initial_state, :max_children, :agent], empty_values: [])
       |> validate_number(:max_children, greater_than: 0)
     end
   end

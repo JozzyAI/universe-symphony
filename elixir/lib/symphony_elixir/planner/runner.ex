@@ -181,6 +181,14 @@ defmodule SymphonyElixir.Planner.Runner do
   # Runs the planner turn with no repo_url and no coding workspace, forcing
   # the safe/default permission mode regardless of the configured agent
   # permission mode (this run never writes code).
+  #
+  # `agent: config.planner.agent` (default "codex") is used instead of
+  # `config.external.agent` (default "mock") — the mock backend's canned
+  # simulation always emits an `approval_required` event partway through,
+  # which would make every planner run fail. `deny_pending_approvals: true`
+  # is a backstop: if the planner turn nonetheless requests file-modification
+  # approval, ExternalExecutor denies it and stops the run instead of leaving
+  # it pending.
   defp run_planner_executor(issue, prompt, config) do
     {:ok, output_agent} = Agent.start_link(fn -> [] end)
 
@@ -196,13 +204,14 @@ defmodule SymphonyElixir.Planner.Runner do
     result =
       executor_module().run(issue, prompt, nil,
         command: config.external.command,
-        agent: config.external.agent,
+        agent: config.planner.agent,
         node: config.external.node,
         relay: config.external.relay,
         token: config.external.token,
         encrypt: config.external.encrypt,
         repo_url: nil,
         permission_mode: "default",
+        deny_pending_approvals: true,
         on_message: on_message
       )
 

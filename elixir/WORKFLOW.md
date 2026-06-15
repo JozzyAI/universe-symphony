@@ -89,6 +89,10 @@ planner:
   trigger_label: "type:plan"
   child_initial_state: "Backlog"
   max_children: 10
+  # Agent backend for the plan-only Codex turn. Independent of
+  # external.agent (which defaults to "mock"); always "codex" so the
+  # planner gets a real planning turn, not the mock CLI simulation.
+  agent: "codex"
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
