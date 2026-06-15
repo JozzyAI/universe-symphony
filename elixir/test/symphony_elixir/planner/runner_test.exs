@@ -11,7 +11,7 @@ defmodule SymphonyElixir.Planner.RunnerTest do
 
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Planner.Runner
+  alias SymphonyElixir.Planner.{PlanExtractor, Runner}
 
   defmodule FakePlannerLinearClient do
     def create_issue(attrs) do
@@ -93,6 +93,13 @@ defmodule SymphonyElixir.Planner.RunnerTest do
           on_message.(%{event: :output, message: output})
           :ok
 
+        # Mirrors the real ExternalExecutor: one `:output` event per line,
+        # with no trailing newline on each line's message.
+        {:ok_lines, lines} ->
+          on_message = Keyword.fetch!(opts, :on_message)
+          Enum.each(lines, fn line -> on_message.(%{event: :output, message: line}) end)
+          :ok
+
         {:error, _reason} = error ->
           error
 
@@ -169,6 +176,15 @@ defmodule SymphonyElixir.Planner.RunnerTest do
     "Planning notes for this issue.\n\n```json\n#{json}\n```\n"
   end
 
+  # Splits `planner_output/1`'s text into the line-by-line, no-trailing-newline
+  # `:output` messages the real ExternalExecutor streams from Codex.
+  defp planner_output_lines(titles) do
+    titles
+    |> planner_output()
+    |> String.trim_trailing("\n")
+    |> String.split("\n")
+  end
+
   test "creates child issues in Backlog with parentId/projectId/teamId, posts a summary comment with the idempotency marker, and moves the parent to Human Review" do
     Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["First child title", "Second child title"])})
 
@@ -193,6 +209,52 @@ defmodule SymphonyElixir.Planner.RunnerTest do
     for identifier <- identifiers do
       assert comment =~ identifier
     end
+
+    assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
+    assert_receive {:planner_done, "parent-1"}
+  end
+
+  test "executor output delivered as line-split :output events (no trailing newlines) is reassembled with newlines, preserving the fenced ```json block, and creates child issues in Backlog" do
+    Application.put_env(
+      :symphony_elixir,
+      :fake_executor_result,
+      {:ok_lines, planner_output_lines(["First child title", "Second child title"])}
+    )
+
+    issue = parent_issue()
+
+    assert {:ok, {:created_children, identifiers}} = Runner.run(issue, recipient: self())
+    assert length(identifiers) == 2
+
+    for _ <- identifiers do
+      assert_receive {:create_issue_called, attrs}
+      assert attrs.state_id == "state-backlog"
+      assert attrs.description =~ "## Acceptance criteria"
+      assert attrs.description =~ "Open a PR, do not merge."
+    end
+
+    assert_receive {:memory_tracker_comment, "parent-1", comment}
+    assert comment =~ "<!-- symphony-planner:v1 parent=parent-1 children=["
+
+    assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
+    assert_receive {:planner_done, "parent-1"}
+  end
+
+  test "line-split executor output with no fenced json block still moves the parent to Human Review with an error comment and creates no children" do
+    Application.put_env(
+      :symphony_elixir,
+      :fake_executor_result,
+      {:ok_lines, ["I could not come up with a plan.", "Sorry about that."]}
+    )
+
+    issue = parent_issue()
+
+    assert {:ok, {:failed, {:plan_extraction_failed, :no_json_block_found}}} = Runner.run(issue, recipient: self())
+
+    refute_receive {:create_issue_called, _attrs}
+
+    assert_receive {:memory_tracker_comment, "parent-1", comment}
+    assert comment =~ "could not finish planning"
 
     assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
     assert_receive {:planner_done, "parent-1"}
@@ -488,6 +550,17 @@ defmodule SymphonyElixir.Planner.RunnerTest do
 
       assert_receive {:memory_tracker_state_update, "parent-1", "Human Review"}
       assert_receive {:planner_done, "parent-1"}
+    end
+  end
+
+  describe "join_output_lines/1" do
+    test "rejoins line-split output with newlines so PlanExtractor can find the fenced json block" do
+      lines = ["intro", "```json", ~s({"children": []}), "```"]
+
+      output = Runner.join_output_lines(lines)
+
+      assert output == "intro\n```json\n{\"children\": []}\n```"
+      assert {:ok, %{"children" => []}} = PlanExtractor.extract_json_block(output)
     end
   end
 
