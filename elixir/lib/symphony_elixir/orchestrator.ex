@@ -192,6 +192,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  # PlannerRunner finished (success, handled failure, or crash) — release the
+  # dispatch claim taken in `dispatch_to_planner/2` so this issue can be
+  # picked up again on a later poll if it is still in a candidate state
+  # (PlannerRunner moves the parent out of Todo on every path, so this is
+  # normally a no-op for re-dispatch purposes).
+  def handle_info({:planner_done, issue_id}, state) when is_binary(issue_id) do
+    Logger.info("PlannerRunner finished for issue_id=#{issue_id}")
+
+    state = release_issue_claim(state, issue_id)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
@@ -416,6 +429,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec choose_issues_for_test([Issue.t()], term()) :: term()
   def choose_issues_for_test(issues, %State{} = state) when is_list(issues) do
     choose_issues(issues, state)
+  end
+
+  @doc false
+  @spec planner_dispatch_for_test(Issue.t(), term()) :: boolean()
+  def planner_dispatch_for_test(%Issue{} = issue, %State{} = state) do
+    planner_dispatch?(issue, state, Config.settings!().planner)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -793,16 +812,120 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    planner_config = Config.settings!().planner
 
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states, issues) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
+      cond do
+        planner_dispatch?(issue, state_acc, planner_config) ->
+          dispatch_to_planner(state_acc, issue)
+
+        should_dispatch_issue?(issue, state_acc, active_states, terminal_states, issues) ->
+          dispatch_issue(state_acc, issue)
+
+        true ->
+          state_acc
       end
     end)
+  end
+
+  # Routes a parent issue to PlannerRunner instead of the normal
+  # repo-binding/coding dispatch path. Checked before
+  # `should_dispatch_issue?/5` so a `type:plan` parent in Todo never reaches
+  # `dispatch_issue/2` (and therefore never reaches `AgentRunner`) while
+  # `planner.enabled` is true. Disabled by default — when `planner.enabled`
+  # is not `true`, this always returns `false` and dispatch behavior is
+  # unchanged.
+  defp planner_dispatch?(
+         %Issue{id: id, state: state_name, labels: labels},
+         %State{claimed: claimed, running: running, blocked: blocked},
+         %{enabled: true, trigger_label: trigger_label}
+       )
+       when is_binary(id) and is_binary(state_name) and is_list(labels) and is_binary(trigger_label) do
+    normalize_issue_state(state_name) == "todo" and
+      trigger_label in labels and
+      !MapSet.member?(claimed, id) and
+      !Map.has_key?(running, id) and
+      !Map.has_key?(blocked, id)
+  end
+
+  defp planner_dispatch?(_issue, _state, _planner_config), do: false
+
+  # Mirrors `dispatch_issue/4`'s lifecycle for PlannerRunner: revalidate the
+  # issue is still dispatchable against the tracker, then (in
+  # `do_dispatch_to_planner/2`) move it Todo -> In Progress *before* spawning
+  # PlannerRunner.
+  #
+  # Restart safety: `state.claimed` is in-memory only and is lost if Symphony
+  # restarts. Moving the parent to "In Progress" in the tracker *before*
+  # spawning PlannerRunner persists the dispatch decision outside the
+  # orchestrator process — after a restart the issue is no longer "Todo", so
+  # `planner_dispatch?/3` will not select it again on the next poll even
+  # though `state.claimed`/`state.running` have been reset to empty.
+  defp dispatch_to_planner(%State{} = state, %Issue{} = issue) do
+    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+      {:ok, %Issue{} = refreshed_issue} ->
+        do_dispatch_to_planner(state, refreshed_issue)
+
+      {:skip, :missing} ->
+        Logger.info("Skipping planner dispatch; issue no longer active or visible: #{issue_context(issue)}")
+        state
+
+      {:skip, %Issue{} = refreshed_issue} ->
+        Logger.info("Skipping stale planner dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)}")
+
+        state
+
+      {:error, reason} ->
+        Logger.warning("Skipping planner dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  # Persists the Todo -> In Progress transition before spawning PlannerRunner.
+  # If the transition fails (or the refreshed issue is no longer Todo),
+  # PlannerRunner is not started this poll; the issue stays unclaimed and
+  # Todo, so it is naturally reconsidered on the next poll.
+  defp do_dispatch_to_planner(%State{} = state, %Issue{id: id, state: state_name} = issue)
+       when is_binary(id) do
+    if normalize_issue_state(state_name) == "todo" do
+      case Tracker.update_issue_state(id, "In Progress") do
+        :ok ->
+          spawn_planner_runner(state, %{issue | state: "In Progress"})
+
+        {:error, reason} ->
+          Logger.warning("Skipping planner dispatch; failed to move #{issue_context(issue)} to In Progress: #{inspect(reason)}")
+          state
+      end
+    else
+      Logger.info("Skipping stale planner dispatch after refresh: #{issue_context(issue)} state=#{inspect(state_name)} is no longer Todo")
+
+      state
+    end
+  end
+
+  # Spawns PlannerRunner for `issue` (the parent), which has already been
+  # moved to "In Progress" by `do_dispatch_to_planner/2`. PlannerRunner is
+  # never tracked in `state.running` — it does not participate in the
+  # AgentRunner retry/PR/stall machinery in `handle_agent_down/5`. Instead it
+  # is tracked only via `state.claimed` (to prevent re-dispatch on later
+  # polls while it is in flight) and releases that claim by sending
+  # `{:planner_done, issue.id}` back to this process when it finishes.
+  defp spawn_planner_runner(%State{} = state, %Issue{} = issue) do
+    recipient = self()
+
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           SymphonyElixir.Planner.Runner.run(issue, recipient: recipient)
+         end) do
+      {:ok, pid} ->
+        Logger.info("Dispatching issue to PlannerRunner: #{issue_context(issue)} pid=#{inspect(pid)}")
+        %{state | claimed: MapSet.put(state.claimed, issue.id)}
+
+      {:error, reason} ->
+        Logger.error("Unable to spawn PlannerRunner for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do

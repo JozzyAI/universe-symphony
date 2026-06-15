@@ -179,6 +179,20 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @team_states_query """
+  query SymphonyTeamStates($teamId: String!) {
+    team(id: $teamId) {
+      id
+      states {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+  }
+  """
+
   @issue_comments_query """
   query SymphonyIssueComments($issueId: String!) {
     issue(id: $issueId) {
@@ -374,6 +388,41 @@ defmodule SymphonyElixir.Linear.Client do
       |> case do
         %{id: id} -> {:ok, id}
         nil -> {:error, :label_not_found}
+      end
+    end
+  end
+
+  @spec fetch_team_states(String.t(), keyword()) :: {:ok, [%{id: String.t(), name: String.t()}]} | {:error, term()}
+  def fetch_team_states(team_id, opts \\ []) when is_binary(team_id) and is_list(opts) do
+    case graphql(@team_states_query, %{"teamId" => team_id}, opts) do
+      {:ok, %{"data" => %{"team" => %{"states" => %{"nodes" => nodes}}}}} when is_list(nodes) ->
+        {:ok, Enum.map(nodes, &normalize_team_state/1)}
+
+      {:ok, %{"data" => %{"team" => nil}}} ->
+        {:error, :linear_team_not_found}
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :linear_unknown_payload}
+    end
+  end
+
+  @spec resolve_team_state_id(String.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def resolve_team_state_id(team_id, state_name, opts \\ [])
+      when is_binary(team_id) and is_binary(state_name) and is_list(opts) do
+    normalized_name = state_name |> String.trim() |> String.downcase()
+
+    with {:ok, states} <- fetch_team_states(team_id, opts) do
+      states
+      |> Enum.find(fn %{name: name} -> is_binary(name) and String.downcase(String.trim(name)) == normalized_name end)
+      |> case do
+        %{id: id} -> {:ok, id}
+        nil -> {:error, :state_not_found}
       end
     end
   end
@@ -923,6 +972,10 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_team_label(label) do
     %{id: label["id"], name: label["name"]}
+  end
+
+  defp normalize_team_state(state) do
+    %{id: state["id"], name: state["name"]}
   end
 
   defp normalize_comment(comment) do

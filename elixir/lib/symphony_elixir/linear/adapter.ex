@@ -83,6 +83,13 @@ defmodule SymphonyElixir.Linear.Adapter do
   def resolve_team_label_id(team_id, label_name) when is_binary(team_id) and is_binary(label_name),
     do: client_module().resolve_team_label_id(team_id, label_name)
 
+  @spec fetch_team_states(String.t()) :: {:ok, [%{id: String.t(), name: String.t()}]} | {:error, term()}
+  def fetch_team_states(team_id) when is_binary(team_id), do: client_module().fetch_team_states(team_id)
+
+  @spec resolve_team_state_id(String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def resolve_team_state_id(team_id, state_name) when is_binary(team_id) and is_binary(state_name),
+    do: client_module().resolve_team_state_id(team_id, state_name)
+
   @spec fetch_issue_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
   def fetch_issue_comments(issue_id) when is_binary(issue_id), do: client_module().fetch_issue_comments(issue_id)
 

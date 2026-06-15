@@ -144,6 +144,10 @@ defmodule SymphonyElixir.TestSupport do
           observability_render_interval_ms: 16,
           server_port: nil,
           server_host: nil,
+          planner_enabled: false,
+          planner_trigger_label: "type:plan",
+          planner_child_initial_state: "Backlog",
+          planner_max_children: 10,
           prompt: @workflow_prompt
         ],
         overrides
@@ -194,6 +198,10 @@ defmodule SymphonyElixir.TestSupport do
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
+    planner_enabled = Keyword.get(config, :planner_enabled)
+    planner_trigger_label = Keyword.get(config, :planner_trigger_label)
+    planner_child_initial_state = Keyword.get(config, :planner_child_initial_state)
+    planner_max_children = Keyword.get(config, :planner_max_children)
     prompt = Keyword.get(config, :prompt)
 
     sections =
@@ -241,6 +249,7 @@ defmodule SymphonyElixir.TestSupport do
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
+        planner_yaml(planner_enabled, planner_trigger_label, planner_child_initial_state, planner_max_children),
         "---",
         prompt
       ]
@@ -429,6 +438,17 @@ defmodule SymphonyElixir.TestSupport do
       host && "  host: #{yaml_value(host)}"
     ]
     |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp planner_yaml(enabled, trigger_label, child_initial_state, max_children) do
+    [
+      "planner:",
+      "  enabled: #{yaml_value(enabled)}",
+      "  trigger_label: #{yaml_value(trigger_label)}",
+      "  child_initial_state: #{yaml_value(child_initial_state)}",
+      "  max_children: #{yaml_value(max_children)}"
+    ]
     |> Enum.join("\n")
   end
 
