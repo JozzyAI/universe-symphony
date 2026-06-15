@@ -192,6 +192,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  # PlannerRunner finished (success, handled failure, or crash) — release the
+  # dispatch claim taken in `dispatch_to_planner/2` so this issue can be
+  # picked up again on a later poll if it is still in a candidate state
+  # (PlannerRunner moves the parent out of Todo on every path, so this is
+  # normally a no-op for re-dispatch purposes).
+  def handle_info({:planner_done, issue_id}, state) when is_binary(issue_id) do
+    Logger.info("PlannerRunner finished for issue_id=#{issue_id}")
+
+    state = release_issue_claim(state, issue_id)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
@@ -416,6 +429,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec choose_issues_for_test([Issue.t()], term()) :: term()
   def choose_issues_for_test(issues, %State{} = state) when is_list(issues) do
     choose_issues(issues, state)
+  end
+
+  @doc false
+  @spec planner_dispatch_for_test(Issue.t(), term()) :: boolean()
+  def planner_dispatch_for_test(%Issue{} = issue, %State{} = state) do
+    planner_dispatch?(issue, state, Config.settings!().planner)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -793,16 +812,66 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    planner_config = Config.settings!().planner
 
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states, issues) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
+      cond do
+        planner_dispatch?(issue, state_acc, planner_config) ->
+          dispatch_to_planner(state_acc, issue)
+
+        should_dispatch_issue?(issue, state_acc, active_states, terminal_states, issues) ->
+          dispatch_issue(state_acc, issue)
+
+        true ->
+          state_acc
       end
     end)
+  end
+
+  # Routes a parent issue to PlannerRunner instead of the normal
+  # repo-binding/coding dispatch path. Checked before
+  # `should_dispatch_issue?/5` so a `type:plan` parent in Todo never reaches
+  # `dispatch_issue/2` (and therefore never reaches `AgentRunner`) while
+  # `planner.enabled` is true. Disabled by default — when `planner.enabled`
+  # is not `true`, this always returns `false` and dispatch behavior is
+  # unchanged.
+  defp planner_dispatch?(
+         %Issue{id: id, state: state_name, labels: labels},
+         %State{claimed: claimed, running: running, blocked: blocked},
+         %{enabled: true, trigger_label: trigger_label}
+       )
+       when is_binary(id) and is_binary(state_name) and is_list(labels) and is_binary(trigger_label) do
+    normalize_issue_state(state_name) == "todo" and
+      trigger_label in labels and
+      !MapSet.member?(claimed, id) and
+      !Map.has_key?(running, id) and
+      !Map.has_key?(blocked, id)
+  end
+
+  defp planner_dispatch?(_issue, _state, _planner_config), do: false
+
+  # Spawns PlannerRunner for `issue` (the parent). PlannerRunner is never
+  # tracked in `state.running` — it does not participate in the
+  # AgentRunner retry/PR/stall machinery in `handle_agent_down/5`. Instead it
+  # is tracked only via `state.claimed` (to prevent re-dispatch on later
+  # polls while it is in flight) and releases that claim by sending
+  # `{:planner_done, issue.id}` back to this process when it finishes.
+  defp dispatch_to_planner(%State{} = state, %Issue{} = issue) do
+    recipient = self()
+
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           SymphonyElixir.Planner.Runner.run(issue, recipient: recipient)
+         end) do
+      {:ok, pid} ->
+        Logger.info("Dispatching issue to PlannerRunner: #{issue_context(issue)} pid=#{inspect(pid)}")
+        %{state | claimed: MapSet.put(state.claimed, issue.id)}
+
+      {:error, reason} ->
+        Logger.error("Unable to spawn PlannerRunner for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
