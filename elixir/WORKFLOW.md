@@ -84,6 +84,11 @@ binding:
     node: joey-pc
     agent: codex
     encrypt: true
+planner:
+  enabled: true
+  trigger_label: "type:plan"
+  child_initial_state: "Backlog"
+  max_children: 10
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
