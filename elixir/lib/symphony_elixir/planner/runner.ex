@@ -233,7 +233,7 @@ defmodule SymphonyElixir.Planner.Runner do
         on_message: on_message
       )
 
-    output = output_agent |> Agent.get(& &1) |> Enum.reverse() |> Enum.join("")
+    output = output_agent |> Agent.get(& &1) |> Enum.reverse() |> join_output_lines()
     Agent.stop(output_agent)
 
     case result do
@@ -241,6 +241,14 @@ defmodule SymphonyElixir.Planner.Runner do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # Each streamed `:output` event carries one line of Codex's response
+  # without a trailing newline, so lines must be rejoined with `"\n"` to
+  # preserve fenced Markdown structure (e.g. the final ```json block) for
+  # `PlanExtractor`. Exposed (not private) so it can be unit-tested directly.
+  @doc false
+  @spec join_output_lines([String.t()]) :: String.t()
+  def join_output_lines(lines), do: Enum.join(lines, "\n")
 
   defp executor_module do
     Application.get_env(:symphony_elixir, :planner_executor_module, ExternalExecutor)
