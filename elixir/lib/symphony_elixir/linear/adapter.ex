@@ -73,6 +73,22 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  @spec create_issue(map()) :: {:ok, map()} | {:error, term()}
+  def create_issue(attrs) when is_map(attrs), do: client_module().create_issue(attrs)
+
+  @spec fetch_team_labels(String.t()) :: {:ok, [%{id: String.t(), name: String.t()}]} | {:error, term()}
+  def fetch_team_labels(team_id) when is_binary(team_id), do: client_module().fetch_team_labels(team_id)
+
+  @spec resolve_team_label_id(String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def resolve_team_label_id(team_id, label_name) when is_binary(team_id) and is_binary(label_name),
+    do: client_module().resolve_team_label_id(team_id, label_name)
+
+  @spec fetch_issue_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id), do: client_module().fetch_issue_comments(issue_id)
+
+  @spec fetch_issue_children(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_children(issue_id) when is_binary(issue_id), do: client_module().fetch_issue_children(issue_id)
+
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end

@@ -27,6 +27,12 @@ defmodule SymphonyElixir.Linear.Client do
         assignee {
           id
         }
+        team {
+          id
+        }
+        parent {
+          id
+        }
         labels {
           nodes {
             name
@@ -88,6 +94,12 @@ defmodule SymphonyElixir.Linear.Client do
         assignee {
           id
         }
+        team {
+          id
+        }
+        parent {
+          id
+        }
         labels {
           nodes {
             name
@@ -132,6 +144,70 @@ defmodule SymphonyElixir.Linear.Client do
   query SymphonyLinearViewer {
     viewer {
       id
+    }
+  }
+  """
+
+  @create_issue_mutation """
+  mutation SymphonyCreateIssue($input: IssueCreateInput!) {
+    issueCreate(input: $input) {
+      success
+      issue {
+        id
+        identifier
+        title
+        url
+        state {
+          name
+        }
+      }
+    }
+  }
+  """
+
+  @team_labels_query """
+  query SymphonyTeamLabels($teamId: String!) {
+    team(id: $teamId) {
+      id
+      labels {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+  }
+  """
+
+  @issue_comments_query """
+  query SymphonyIssueComments($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      comments {
+        nodes {
+          id
+          body
+          createdAt
+        }
+      }
+    }
+  }
+  """
+
+  @issue_children_query """
+  query SymphonyIssueChildren($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      children {
+        nodes {
+          id
+          identifier
+          title
+          state {
+            name
+          }
+        }
+      }
     }
   }
   """
@@ -242,6 +318,103 @@ defmodule SymphonyElixir.Linear.Client do
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(Redact.redact(reason))}")
         {:error, {:linear_api_request, reason}}
+    end
+  end
+
+  @spec create_issue(map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def create_issue(attrs, opts \\ []) when is_map(attrs) and is_list(opts) do
+    with {:ok, input} <- build_issue_create_input(attrs) do
+      case graphql(@create_issue_mutation, %{"input" => input}, opts) do
+        {:ok, %{"data" => %{"issueCreate" => %{"success" => true, "issue" => issue}}}} when is_map(issue) ->
+          {:ok, normalize_created_issue(issue)}
+
+        {:ok, %{"data" => %{"issueCreate" => %{"success" => false}}}} ->
+          {:error, :issue_create_failed}
+
+        {:ok, %{"errors" => errors}} ->
+          {:error, {:linear_graphql_errors, errors}}
+
+        {:error, reason} ->
+          {:error, reason}
+
+        _ ->
+          {:error, :issue_create_failed}
+      end
+    end
+  end
+
+  @spec fetch_team_labels(String.t(), keyword()) :: {:ok, [%{id: String.t(), name: String.t()}]} | {:error, term()}
+  def fetch_team_labels(team_id, opts \\ []) when is_binary(team_id) and is_list(opts) do
+    case graphql(@team_labels_query, %{"teamId" => team_id}, opts) do
+      {:ok, %{"data" => %{"team" => %{"labels" => %{"nodes" => nodes}}}}} when is_list(nodes) ->
+        {:ok, Enum.map(nodes, &normalize_team_label/1)}
+
+      {:ok, %{"data" => %{"team" => nil}}} ->
+        {:error, :linear_team_not_found}
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :linear_unknown_payload}
+    end
+  end
+
+  @spec resolve_team_label_id(String.t(), String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def resolve_team_label_id(team_id, label_name, opts \\ [])
+      when is_binary(team_id) and is_binary(label_name) and is_list(opts) do
+    normalized_name = label_name |> String.trim() |> String.downcase()
+
+    with {:ok, labels} <- fetch_team_labels(team_id, opts) do
+      labels
+      |> Enum.find(fn %{name: name} -> is_binary(name) and String.downcase(String.trim(name)) == normalized_name end)
+      |> case do
+        %{id: id} -> {:ok, id}
+        nil -> {:error, :label_not_found}
+      end
+    end
+  end
+
+  @spec fetch_issue_comments(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id, opts \\ []) when is_binary(issue_id) and is_list(opts) do
+    case graphql(@issue_comments_query, %{"issueId" => issue_id}, opts) do
+      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}} when is_list(nodes) ->
+        {:ok, Enum.map(nodes, &normalize_comment/1)}
+
+      {:ok, %{"data" => %{"issue" => nil}}} ->
+        {:error, :linear_issue_not_found}
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :linear_unknown_payload}
+    end
+  end
+
+  @spec fetch_issue_children(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_children(issue_id, opts \\ []) when is_binary(issue_id) and is_list(opts) do
+    case graphql(@issue_children_query, %{"issueId" => issue_id}, opts) do
+      {:ok, %{"data" => %{"issue" => %{"children" => %{"nodes" => nodes}}}}} when is_list(nodes) ->
+        {:ok, Enum.map(nodes, &normalize_child_issue/1)}
+
+      {:ok, %{"data" => %{"issue" => nil}}} ->
+        {:error, :linear_issue_not_found}
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :linear_unknown_payload}
     end
   end
 
@@ -529,6 +702,8 @@ defmodule SymphonyElixir.Linear.Client do
       project_description: extract_project_description(issue),
       project_resources: extract_project_resources(issue),
       project_id: extract_project_id(issue),
+      team_id: extract_team_id(issue),
+      parent_id: extract_parent_id(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
@@ -621,6 +796,12 @@ defmodule SymphonyElixir.Linear.Client do
   defp extract_project_id(%{"project" => %{"id" => id}}) when is_binary(id), do: id
   defp extract_project_id(_), do: nil
 
+  defp extract_team_id(%{"team" => %{"id" => id}}) when is_binary(id), do: id
+  defp extract_team_id(_), do: nil
+
+  defp extract_parent_id(%{"parent" => %{"id" => id}}) when is_binary(id), do: id
+  defp extract_parent_id(_), do: nil
+
   # The `vibe:` project-binding block is typically written into the
   # project's longer "content" document, but fall back to the shorter
   # "description" field if content is empty so either location works.
@@ -700,4 +881,64 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp parse_priority(priority) when is_integer(priority), do: priority
   defp parse_priority(_priority), do: nil
+
+  defp build_issue_create_input(attrs) when is_map(attrs) do
+    team_id = Map.get(attrs, :team_id)
+    title = Map.get(attrs, :title)
+
+    cond do
+      not is_binary(team_id) or team_id == "" ->
+        {:error, :missing_team_id}
+
+      not is_binary(title) or title == "" ->
+        {:error, :missing_title}
+
+      true ->
+        input =
+          %{"teamId" => team_id, "title" => title}
+          |> maybe_put("description", Map.get(attrs, :description))
+          |> maybe_put("projectId", Map.get(attrs, :project_id))
+          |> maybe_put("parentId", Map.get(attrs, :parent_id))
+          |> maybe_put("stateId", Map.get(attrs, :state_id))
+          |> maybe_put("labelIds", Map.get(attrs, :label_ids))
+
+        {:ok, input}
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, _key, ""), do: map
+  defp maybe_put(map, _key, []), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp normalize_created_issue(issue) do
+    %{
+      id: issue["id"],
+      identifier: issue["identifier"],
+      title: issue["title"],
+      url: issue["url"],
+      state: get_in(issue, ["state", "name"])
+    }
+  end
+
+  defp normalize_team_label(label) do
+    %{id: label["id"], name: label["name"]}
+  end
+
+  defp normalize_comment(comment) do
+    %{
+      id: comment["id"],
+      body: comment["body"],
+      created_at: parse_datetime(comment["createdAt"])
+    }
+  end
+
+  defp normalize_child_issue(issue) do
+    %{
+      id: issue["id"],
+      identifier: issue["identifier"],
+      title: issue["title"],
+      state: get_in(issue, ["state", "name"])
+    }
+  end
 end
