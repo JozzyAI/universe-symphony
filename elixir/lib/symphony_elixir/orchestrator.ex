@@ -665,13 +665,19 @@ defmodule SymphonyElixir.Orchestrator do
         |> stop_and_block_issue(issue_id, running_entry, error)
       else
         if agent_kind_vibe?() do
-          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; moving to Human Review to avoid duplicate Vibe dispatch")
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; querying Vibe run status before moving to Human Review")
 
           issue = running_entry.issue
+          vibe_run_id = Map.get(running_entry, :vibe_run_id)
+          reason_text = query_vibe_stall_reason(vibe_run_id, elapsed_ms)
 
-          state
-          |> terminate_running_issue(issue_id, false)
-          |> finish_issue_without_pr(issue_id, issue, "agent run stalled for #{elapsed_ms}ms without activity.")
+          result_state =
+            state
+            |> terminate_running_issue(issue_id, false)
+            |> finish_issue_without_pr(issue_id, issue, reason_text)
+
+          maybe_stop_vibe_run(vibe_run_id)
+          result_state
         else
           Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
 
@@ -1382,6 +1388,41 @@ defmodule SymphonyElixir.Orchestrator do
     |> complete_issue(issue_id)
     |> release_issue_claim(issue_id)
   end
+
+  # Queries the Vibe run status when the stream went silent before a stall fires.
+  # Returns a human-readable reason string for the Human Review comment.
+  # Falls back to the generic stall wording if the run_id is absent or the
+  # status query fails — preserving the original behavior for true stalls.
+  defp query_vibe_stall_reason(vibe_run_id, elapsed_ms) when is_binary(vibe_run_id) do
+    config = Config.settings!()
+
+    case SymphonyElixir.Codex.ExternalExecutor.query_run_status(
+           config.external.command,
+           vibe_run_id,
+           config.external.relay,
+           config.external.token
+         ) do
+      {:ok, %{status: "completed"}} ->
+        "Vibe run completed, but stream events were not received before the stall timeout. " <>
+          "A pull request may already exist for this issue. Please check the repository manually."
+
+      _ ->
+        "agent run stalled for #{elapsed_ms}ms without activity."
+    end
+  end
+
+  defp query_vibe_stall_reason(_vibe_run_id, elapsed_ms) do
+    "agent run stalled for #{elapsed_ms}ms without activity."
+  end
+
+  # Stops the Vibe relay run after a stall so any lingering stream process can
+  # exit. Best-effort: errors are caught inside stop_run/4 itself.
+  defp maybe_stop_vibe_run(vibe_run_id) when is_binary(vibe_run_id) do
+    config = Config.settings!()
+    SymphonyElixir.Codex.ExternalExecutor.stop_run(config.external.command, vibe_run_id, config.external.relay, config.external.token)
+  end
+
+  defp maybe_stop_vibe_run(_vibe_run_id), do: :ok
 
   defp agent_kind_vibe? do
     Config.settings!().agent_kind == "vibe"

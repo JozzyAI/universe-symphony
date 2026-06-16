@@ -320,7 +320,39 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     end
   end
 
-  defp stop_run(command, run_id, relay, token) do
+  @spec query_run_status(String.t(), String.t(), String.t() | nil, String.t() | nil) ::
+          {:ok, %{status: String.t()}} | {:error, term()}
+  def query_run_status(command, run_id, relay, token)
+      when is_binary(command) and is_binary(run_id) do
+    args =
+      ["symphony", "status", run_id, "--json"]
+      |> append_relay_stream_args(relay, token)
+
+    try do
+      case System.cmd(command, args, stderr_to_stdout: false) do
+        {output, 0} ->
+          case Jason.decode(String.trim(output)) do
+            {:ok, %{"status" => status}} when is_binary(status) ->
+              {:ok, %{status: status}}
+
+            {:ok, other} ->
+              {:error, {:unexpected_status_response, other}}
+
+            {:error, reason} ->
+              {:error, {:invalid_status_json, reason}}
+          end
+
+        {_output, code} ->
+          {:error, {:status_command_failed, code}}
+      end
+    rescue
+      ErlangError -> {:error, {:command_not_found, command}}
+    end
+  end
+
+  def query_run_status(_command, _run_id, _relay, _token), do: {:error, :invalid_args}
+
+  def stop_run(command, run_id, relay, token) do
     args =
       ["symphony", "stop", run_id]
       |> append_relay_stream_args(relay, token)
