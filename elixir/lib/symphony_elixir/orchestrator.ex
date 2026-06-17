@@ -669,6 +669,7 @@ defmodule SymphonyElixir.Orchestrator do
 
           issue = running_entry.issue
           vibe_run_id = Map.get(running_entry, :vibe_run_id)
+          vibe_stream_os_pid = Map.get(running_entry, :vibe_stream_os_pid)
           reason_text = query_vibe_stall_reason(vibe_run_id, elapsed_ms)
 
           result_state =
@@ -677,6 +678,7 @@ defmodule SymphonyElixir.Orchestrator do
             |> finish_issue_without_pr(issue_id, issue, reason_text)
 
           maybe_stop_vibe_run(vibe_run_id)
+          maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
           result_state
         else
           Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
@@ -1424,6 +1426,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_stop_vibe_run(_vibe_run_id), do: :ok
 
+  defp maybe_kill_vibe_stream(os_pid, run_id) when is_integer(os_pid) and is_binary(run_id) do
+    SymphonyElixir.Codex.ExternalExecutor.kill_stream_process(os_pid, run_id)
+  end
+
+  defp maybe_kill_vibe_stream(_os_pid, _run_id), do: :ok
+
   defp agent_kind_vibe? do
     Config.settings!().agent_kind == "vibe"
   end
@@ -1988,6 +1996,9 @@ defmodule SymphonyElixir.Orchestrator do
             vibe_node_id: Map.get(update, :vibe_node_id),
             vibe_agent: Map.get(update, :vibe_agent)
           }
+
+        event == :vibe_stream_started ->
+          %{vibe_stream_os_pid: Map.get(update, :stream_os_pid)}
 
         event == :approval_required ->
           %{
