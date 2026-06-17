@@ -400,12 +400,16 @@ defmodule SymphonyElixir.Config.Schema do
       # for the coding-agent dispatch path) so the planner always gets a real
       # planning turn instead of the mock CLI simulation.
       field(:agent, :string, default: "codex")
+      # When true, Symphony automatically promotes the next Backlog child to
+      # Todo after a sibling reaches Done. Disabled by default; enable after
+      # validating with JOZ-29.
+      field(:auto_promote_children, :boolean, default: false)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:enabled, :trigger_label, :child_initial_state, :max_children, :agent], empty_values: [])
+      |> cast(attrs, [:enabled, :trigger_label, :child_initial_state, :max_children, :agent, :auto_promote_children], empty_values: [])
       |> validate_number(:max_children, greater_than: 0)
     end
   end

@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Binding, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Planner.ChildPromoter
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -39,7 +40,8 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      tracked_parent_ids: MapSet.new()
     ]
   end
 
@@ -66,6 +68,7 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     run_terminal_workspace_cleanup()
+    send(self(), :rehydrate_parent_ids)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -197,12 +200,42 @@ defmodule SymphonyElixir.Orchestrator do
   # picked up again on a later poll if it is still in a candidate state
   # (PlannerRunner moves the parent out of Todo on every path, so this is
   # normally a no-op for re-dispatch purposes).
+  #
+  # Also add the parent to tracked_parent_ids unconditionally so
+  # auto_promote_pass/1 can monitor its children. ChildPromoter checks the
+  # planner marker before promoting, so entries where planning failed are
+  # silently ignored each tick.
   def handle_info({:planner_done, issue_id}, state) when is_binary(issue_id) do
     Logger.info("PlannerRunner finished for issue_id=#{issue_id}")
 
     state = release_issue_claim(state, issue_id)
+    state = %{state | tracked_parent_ids: MapSet.put(state.tracked_parent_ids, issue_id)}
     notify_dashboard()
     {:noreply, state}
+  end
+
+  # Rehydrates tracked_parent_ids on startup by scanning Linear for
+  # planner-managed parents that survived a BEAM restart.
+  def handle_info(:rehydrate_parent_ids, state) do
+    case Config.settings() do
+      {:ok, %{planner: %{enabled: true, trigger_label: trigger_label}}} ->
+        case ChildPromoter.rehydrate_parent_ids(trigger_label) do
+          {:ok, parent_ids} ->
+            if parent_ids != [] do
+              Logger.info("ChildPromoter: rehydrated #{length(parent_ids)} tracked parent(s) on startup")
+            end
+
+            new_tracked = Enum.reduce(parent_ids, state.tracked_parent_ids, &MapSet.put(&2, &1))
+            {:noreply, %{state | tracked_parent_ids: new_tracked}}
+
+          {:error, reason} ->
+            Logger.warning("ChildPromoter: startup rehydration failed: #{inspect(reason)}")
+            {:noreply, state}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   def handle_info(msg, state) do
@@ -286,6 +319,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
+      |> auto_promote_pass()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -336,6 +370,30 @@ defmodule SymphonyElixir.Orchestrator do
 
       false ->
         state
+    end
+  end
+
+  defp auto_promote_pass(%State{} = state) do
+    if auto_promote_enabled?() and MapSet.size(state.tracked_parent_ids) > 0 do
+      Enum.reduce(state.tracked_parent_ids, state, fn parent_id, acc ->
+        case ChildPromoter.maybe_promote(parent_id) do
+          :all_done ->
+            Logger.info("ChildPromoter: all children done for parent_id=#{parent_id}; removing from tracking")
+            %{acc | tracked_parent_ids: MapSet.delete(acc.tracked_parent_ids, parent_id)}
+
+          _ ->
+            acc
+        end
+      end)
+    else
+      state
+    end
+  end
+
+  defp auto_promote_enabled? do
+    case Config.settings() do
+      {:ok, %{planner: %{auto_promote_children: true}}} -> true
+      _ -> false
     end
   end
 
