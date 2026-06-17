@@ -140,7 +140,21 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
             ]
           )
 
-        Logger.info("ExternalExecutor: streaming run_id=#{run_id} relay=#{inspect(ctx.relay)}")
+        stream_os_pid =
+          case Port.info(port, :os_pid) do
+            {:os_pid, pid} -> pid
+            _ -> nil
+          end
+
+        Logger.info("ExternalExecutor: streaming run_id=#{run_id} relay=#{inspect(ctx.relay)} stream_os_pid=#{inspect(stream_os_pid)}")
+
+        on_message.(%{
+          event: :vibe_stream_started,
+          run_id: run_id,
+          stream_os_pid: stream_os_pid,
+          timestamp: DateTime.utc_now()
+        })
+
         await_stream(port, run_id, ctx, on_message)
     end
   end
@@ -364,6 +378,37 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
     end
   end
 
+  # Terminates the local OS process that was opened for `vibe symphony stream
+  # <run_id>`. Before sending any signal, verifies via /proc/<os_pid>/cmdline
+  # that the process is actually the expected stream process for this run_id, to
+  # avoid killing an unrelated process that happened to reuse the PID. On
+  # mismatch or non-existent PID, logs a warning and returns :ok without
+  # crashing. Sends SIGTERM first; if the process is still alive after 2
+  # seconds, escalates to SIGKILL in a background process so the caller is not
+  # blocked.
+  @spec kill_stream_process(integer(), String.t()) :: :ok
+  def kill_stream_process(os_pid, run_id) when is_integer(os_pid) and is_binary(run_id) do
+    if verify_stream_process_cmdline(os_pid, run_id) do
+      Logger.info("ExternalExecutor: SIGTERM stream os_pid=#{os_pid} run_id=#{run_id}")
+      System.cmd("kill", ["-TERM", to_string(os_pid)], stderr_to_stdout: true)
+
+      spawn(fn ->
+        :timer.sleep(2_000)
+
+        if os_process_alive?(os_pid) do
+          Logger.warning("ExternalExecutor: SIGKILL stream os_pid=#{os_pid} run_id=#{run_id} (SIGTERM timed out)")
+          System.cmd("kill", ["-KILL", to_string(os_pid)], stderr_to_stdout: true)
+        end
+      end)
+    else
+      Logger.warning("ExternalExecutor: stream os_pid=#{os_pid} cmdline does not match run_id=#{run_id}; skipping kill")
+    end
+
+    :ok
+  end
+
+  def kill_stream_process(_os_pid, _run_id), do: :ok
+
   defp append_relay_args(args, node, relay, token)
        when is_binary(node) and is_binary(relay) and is_binary(token) do
     args ++ ["--node", node, "--relay", relay, "--token", token]
@@ -420,5 +465,24 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
 
     File.write!(path, prompt)
     path
+  end
+
+  # Reads /proc/<os_pid>/cmdline (Linux-only) and verifies that the null-
+  # separated argv entries include both the literal string "stream" and the
+  # expected run_id. This prevents killing an unrelated process if the OS has
+  # reused the PID since the stream was started.
+  defp verify_stream_process_cmdline(os_pid, run_id) do
+    case File.read("/proc/#{os_pid}/cmdline") do
+      {:ok, contents} ->
+        args = String.split(contents, <<0>>, trim: true)
+        Enum.any?(args, &(&1 == "stream")) and Enum.any?(args, &(&1 == run_id))
+
+      {:error, _} ->
+        false
+    end
+  end
+
+  defp os_process_alive?(os_pid) do
+    File.exists?("/proc/#{os_pid}")
   end
 end
