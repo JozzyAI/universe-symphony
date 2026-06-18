@@ -433,6 +433,31 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule AutoMerge do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:merge_method, :string, default: "squash")
+      field(:delete_branch, :boolean, default: true)
+      field(:require_checks, :boolean, default: true)
+      field(:allow_no_checks, :boolean, default: false)
+      field(:allowed_repos, {:array, :string}, default: [])
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:enabled, :merge_method, :delete_branch, :require_checks, :allow_no_checks, :allowed_repos],
+        empty_values: []
+      )
+      |> validate_inclusion(:merge_method, ["squash", "merge", "rebase"])
+    end
+  end
+
   embedded_schema do
     field(:agent_kind, :string, default: "codex")
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
@@ -448,6 +473,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
     embeds_one(:planner, Planner, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:auto_merge, AutoMerge, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -544,6 +570,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
     |> cast_embed(:planner, with: &Planner.changeset/2)
+    |> cast_embed(:auto_merge, with: &AutoMerge.changeset/2)
     |> validate_vibe_repo_config()
   end
 
