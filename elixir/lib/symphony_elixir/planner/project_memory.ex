@@ -109,7 +109,7 @@ defmodule SymphonyElixir.Planner.ProjectMemory do
         node_line(normalized_binding),
         agent_line(normalized_binding),
         "Human review required: #{normalized_binding.human_review_required}",
-        "Auto merge: #{normalized_binding.auto_merge}",
+        if(is_nil(normalized_binding.auto_merge), do: nil, else: "Auto merge: #{normalized_binding.auto_merge}"),
         @inherited_end
       ]
       |> Enum.reject(&is_nil/1)

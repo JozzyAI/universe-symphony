@@ -132,7 +132,8 @@ defmodule SymphonyElixir.Planner.AutoMergeTest do
           description: "Some task\n\nAuto merge: true",
           state: "Human Review",
           parent_id: "parent-uuid-123",
-          labels: ["agent:claude-code", "repo:mirror_social"]
+          labels: ["agent:claude-code", "repo:mirror_social"],
+          project_description: nil
         ],
         overrides
       )
@@ -478,6 +479,193 @@ defmodule SymphonyElixir.Planner.AutoMergeTest do
       refute log =~ "ghp_"
       refute log =~ "$VIBE_RELAY_TOKEN"
       refute log =~ "Bearer "
+    end
+  end
+
+  # ─── Project-level auto_merge defaults ────────────────────────────────────
+
+  describe "project-level auto_merge resolution" do
+    test "project auto_merge true + issue description has no Auto merge line → eligible" do
+      # issue description does NOT have 'Auto merge:' → fall back to project_description
+      issue = child_issue("issue-pm-1",
+        description: "Implement feature X.\n\nSome details.",
+        project_description: "For this project, auto-merge child PRs after checks pass."
+      )
+      set_issues([issue])
+      set_comments("issue-pm-1", [pr_comment()])
+      set_pr(@pr_url, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(enabled_config())
+
+      assert_received {:memory_tracker_state_update, "issue-pm-1", "Done"}
+    end
+
+    test "project auto_merge true + issue explicitly false → not eligible" do
+      issue = child_issue("issue-pm-2",
+        description: "Implement feature.\n\n<!-- symphony:inherited-project-memory:v1:start -->\nAuto merge: false\n<!-- symphony:inherited-project-memory:v1:end -->",
+        project_description: "auto-merge child PRs after checks pass"
+      )
+      set_issues([issue])
+      set_comments("issue-pm-2", [pr_comment()])
+      set_pr(@pr_url, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(enabled_config())
+
+      refute_received {:memory_tracker_state_update, _, _}
+    end
+
+    test "project auto_merge false + issue explicitly true → eligible" do
+      issue = child_issue("issue-pm-3",
+        description: "Implement feature.\n\nAuto merge: true",
+        project_description: "do not auto merge anything"
+      )
+      set_issues([issue])
+      set_comments("issue-pm-3", [pr_comment()])
+      set_pr(@pr_url, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(enabled_config())
+
+      assert_received {:memory_tracker_state_update, "issue-pm-3", "Done"}
+    end
+
+    test "global enabled false overrides project true" do
+      issue = child_issue("issue-pm-4",
+        description: "Some task.",
+        project_description: "auto-merge child PRs after checks pass"
+      )
+      set_issues([issue])
+      set_comments("issue-pm-4", [pr_comment()])
+      set_pr(@pr_url, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(disabled_config())
+
+      refute_received {:memory_tracker_state_update, _, _}
+    end
+
+    test "repo not allowlisted overrides project true" do
+      issue = child_issue("issue-pm-5",
+        description: "Some task.",
+        project_description: "auto-merge child PRs after checks pass"
+      )
+      set_issues([issue])
+      set_comments("issue-pm-5", [pr_comment()])
+      set_pr(@pr_url, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(enabled_config(allowed_repos: []))
+
+      refute_received {:memory_tracker_state_update, _, _}
+      assert_received {:memory_tracker_comment, "issue-pm-5", _skip_comment}
+    end
+
+    test "type:plan parent issue never auto-merges even if project says true" do
+      plan_issue = child_issue("issue-pm-6",
+        labels: ["type:plan"],
+        parent_id: nil,
+        project_description: "auto-merge child PRs after checks pass"
+      )
+      set_issues([plan_issue])
+      set_comments("issue-pm-6", [pr_comment()])
+      set_pr(@pr_url, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(enabled_config())
+
+      refute_received {:memory_tracker_state_update, _, _}
+    end
+  end
+
+  # ─── Exact repo matching ──────────────────────────────────────────────────
+
+  describe "exact repo matching" do
+    test "PR URL for allowed repo merges successfully" do
+      issue = child_issue("issue-exact-1")
+      set_issues([issue])
+      set_comments("issue-exact-1", [pr_comment()])
+      set_pr(@pr_url, open_mergeable_pr())
+
+      # @mirror_social_repo is exactly in allowed_repos
+      :ok = AutoMergeMod.scan_and_merge(enabled_config())
+
+      assert_received {:memory_tracker_state_update, "issue-exact-1", "Done"}
+    end
+
+    test "PR URL with trailing path after repo (prefix) does not bypass exact match" do
+      # allowed_repos has mirror_social; PR is for mirror_social_extra (a different repo)
+      wrong_repo_pr = "https://github.com/JozzyAI/mirror_social_extra/pull/1"
+      issue = child_issue("issue-exact-2")
+      set_issues([issue])
+      set_comments("issue-exact-2", [pr_comment(wrong_repo_pr)])
+      set_pr(wrong_repo_pr, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(enabled_config())
+
+      refute_received {:memory_tracker_state_update, _, _}
+      assert_received {:memory_tracker_comment, "issue-exact-2", _skip_comment}
+    end
+
+    test "fin_bot PR is rejected when only mirror_social is allowlisted" do
+      fin_bot_pr = "https://github.com/JozzyAI/fin_bot/pull/99"
+      issue = child_issue("issue-exact-3")
+      set_issues([issue])
+      set_comments("issue-exact-3", [pr_comment(fin_bot_pr)])
+      set_pr(fin_bot_pr, open_mergeable_pr())
+
+      :ok = AutoMergeMod.scan_and_merge(enabled_config())
+
+      refute_received {:memory_tracker_state_update, _, _}
+      assert_received {:memory_tracker_comment, "issue-exact-3", _skip_comment}
+    end
+  end
+
+  # ─── Description Normalizer phrase tests (integration) ───────────────────
+
+  describe "description normalizer phrase detection for auto_merge" do
+    alias SymphonyElixir.Planner.DescriptionNormalizer
+
+    defp norm(desc), do: DescriptionNormalizer.normalize(desc, "Test", %{planner: nil, binding: nil})
+
+    test "phrase 'auto-merge child PRs after checks pass' normalizes to auto_merge true" do
+      result = norm("For this project, auto-merge child PRs after checks pass.")
+      assert result.auto_merge == true
+    end
+
+    test "phrase 'do not auto merge' normalizes to auto_merge false" do
+      result = norm("Do not auto merge this project.")
+      assert result.auto_merge == false
+    end
+
+    test "nil result when no auto_merge phrase present" do
+      result = norm("This project builds a feature.")
+      assert result.auto_merge == nil
+    end
+
+    test "child inherited memory includes Auto merge: true when parent normalizes to auto_merge true" do
+      alias SymphonyElixir.Planner.ProjectMemory
+
+      binding = %{
+        repo_mode: nil, repo_name: nil, repo_owner: "JozzyAI",
+        repo_url: "https://github.com/JozzyAI/mirror_social",
+        repo_status: :resolved, node: "joey-pc", node_id: "node_abc",
+        agent: "claude-code", auto_merge: true, human_review_required: true,
+        tech_stack: [], open_questions: [], inherit_binding_to_children: true
+      }
+
+      block = ProjectMemory.build_inherited_block(binding, "JOZ-30")
+      assert block =~ "Auto merge: true"
+    end
+
+    test "child inherited memory omits Auto merge line when parent auto_merge is nil" do
+      alias SymphonyElixir.Planner.ProjectMemory
+
+      binding = %{
+        repo_mode: nil, repo_name: nil, repo_owner: "JozzyAI",
+        repo_url: "https://github.com/JozzyAI/mirror_social",
+        repo_status: :resolved, node: "joey-pc", node_id: "node_abc",
+        agent: "claude-code", auto_merge: nil, human_review_required: true,
+        tech_stack: [], open_questions: [], inherit_binding_to_children: true
+      }
+
+      block = ProjectMemory.build_inherited_block(binding, "JOZ-30")
+      refute block =~ "Auto merge:"
     end
   end
 end

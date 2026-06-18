@@ -245,6 +245,19 @@ defmodule SymphonyElixir.Planner.ProjectMemoryTest do
       assert block =~ "Auto merge: false"
     end
 
+    test "omits Auto merge line when auto_merge is nil (unset)" do
+      binding = %{full_binding() | auto_merge: nil}
+      block = ProjectMemory.build_inherited_block(binding, "JOZ-30")
+      assert block =~ "Human review required: true"
+      refute block =~ "Auto merge:"
+    end
+
+    test "includes Auto merge: true when auto_merge is true" do
+      binding = %{full_binding() | auto_merge: true}
+      block = ProjectMemory.build_inherited_block(binding, "JOZ-30")
+      assert block =~ "Auto merge: true"
+    end
+
     test "starts and ends with inherited markers" do
       block = ProjectMemory.build_inherited_block(full_binding(), "JOZ-30")
       assert String.starts_with?(block, @inherited_start)

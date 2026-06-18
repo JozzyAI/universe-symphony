@@ -682,7 +682,7 @@ defmodule SymphonyElixir.Planner.RunnerTest do
       refute "type:plan" in (attrs[:label_ids] || [])
     end
 
-    test "auto_merge defaults false even when not explicitly stated" do
+    test "auto_merge is omitted from managed block when not explicitly stated (nil/unset)" do
       Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
 
       issue = parent_issue(title: "Test", description: "vibe: use joey_pc use codex")
@@ -690,7 +690,7 @@ defmodule SymphonyElixir.Planner.RunnerTest do
       assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
 
       assert_receive {:memory_tracker_description_update, "parent-1", new_desc}
-      assert new_desc =~ "auto_merge: false"
+      refute new_desc =~ "auto_merge:"
     end
 
     test "human_review_required defaults true" do

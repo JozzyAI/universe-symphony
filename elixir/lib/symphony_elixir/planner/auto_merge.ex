@@ -2,17 +2,20 @@ defmodule SymphonyElixir.Planner.AutoMerge do
   @moduledoc """
   Symphony auto-merge v1 for child issue PRs.
 
-  Scans issues in Human Review state and automatically merges eligible PRs.
+  Resolution order (all must pass):
+  1. `auto_merge.enabled: true` in WORKFLOW.md
+  2. PR repo exactly in `auto_merge.allowed_repos`
+  3. Issue is a child (has parent_id, no type:plan label)
+  4. Auto-merge consent:
+     - issue description has `Auto merge: true` → eligible
+     - issue description has `Auto merge: false` → never eligible
+     - issue description has no `Auto merge:` line → fall back to
+       project_description phrases (auto-merge, automatically merge, etc.)
+  5. PR is open, mergeable (no conflicts), checks passed
 
-  Safety policy:
-  - Only child issues (has parent_id, no type:plan label) are eligible.
-  - Per-issue opt-in required: description must contain `Auto merge: true`.
-  - PR repo must be in auto_merge.allowed_repos (full GitHub URL).
-  - PR must be open, mergeable (no conflicts), and have checks passed.
-  - Idempotency marker prevents re-processing after a successful merge.
-  - Terminal failures (conflicts, failed checks, not allowlisted) post a
-    comment and stop retrying; transient states (pending checks) retry silently.
-  - Universe-symphony and parent issues are never eligible.
+  Idempotency: `<!-- symphony:auto-merge:v1 ... status=merged -->` marker
+  prevents re-processing. Terminal failures post one comment and stop retrying;
+  pending checks retry silently on the next poll.
   """
 
   require Logger
@@ -21,8 +24,9 @@ defmodule SymphonyElixir.Planner.AutoMerge do
   alias SymphonyElixir.Linear.Adapter
 
   @pr_url_regex ~r/Symphony: PR ready for review — (https:\/\/github\.com\/\S+)/
-  @auto_merge_opt_in_regex ~r/Auto merge:\s*true/i
   @merge_marker_prefix "<!-- symphony:auto-merge:v1"
+  @auto_merge_positive_regex ~r/\bauto[\s_\-]?merge\b|\bautomatically\s+merge\b|\bmerge\s+child\s+(?:prs?|pull\s+requests?)\s+after\s+checks?\s+pass\b/i
+  @auto_merge_negative_regex ~r/\b(?:do\s+not|don'?t|no)\s+(?:auto[\s_\-]?merge|automatically\s+merge)\b|\bmanual\s+review\s+required\b|\bhuman\s+review\s+(?:only|required)\b/i
 
   @doc """
   Scans issues in Human Review state and auto-merges eligible PRs.
@@ -72,7 +76,7 @@ defmodule SymphonyElixir.Planner.AutoMerge do
       is_nil(issue.parent_id) ->
         :skipped
 
-      not issue_opted_in?(issue) ->
+      not resolve_auto_merge(issue) ->
         :skipped
 
       true ->
@@ -115,8 +119,32 @@ defmodule SymphonyElixir.Planner.AutoMerge do
     end
   end
 
-  defp issue_opted_in?(%{description: desc}) do
-    Regex.match?(@auto_merge_opt_in_regex, desc || "")
+  defp resolve_auto_merge(issue) do
+    case parse_issue_auto_merge(issue.description) do
+      true -> true
+      false -> false
+      nil -> parse_project_auto_merge(issue.project_description)
+    end
+  end
+
+  defp parse_issue_auto_merge(nil), do: nil
+
+  defp parse_issue_auto_merge(description) do
+    cond do
+      Regex.match?(~r/Auto merge:\s*true/i, description) -> true
+      Regex.match?(~r/Auto merge:\s*false/i, description) -> false
+      true -> nil
+    end
+  end
+
+  defp parse_project_auto_merge(nil), do: false
+
+  defp parse_project_auto_merge(project_description) do
+    cond do
+      Regex.match?(@auto_merge_negative_regex, project_description) -> false
+      Regex.match?(@auto_merge_positive_regex, project_description) -> true
+      true -> false
+    end
   end
 
   defp has_auto_merge_marker?(comments, issue_id) do
@@ -137,10 +165,23 @@ defmodule SymphonyElixir.Planner.AutoMerge do
   end
 
   defp check_repo_allowed(pr_url, allowed_repos) do
-    if Enum.any?(allowed_repos, fn repo -> String.starts_with?(pr_url, repo <> "/") end) do
-      :ok
-    else
-      {:skip_terminal, "PR repo not in auto_merge.allowed_repos: #{pr_url}"}
+    case extract_repo_url(pr_url) do
+      {:ok, repo_url} ->
+        if repo_url in allowed_repos do
+          :ok
+        else
+          {:skip_terminal, "PR repo not in auto_merge.allowed_repos: #{repo_url}"}
+        end
+
+      :error ->
+        {:skip_terminal, "Cannot determine repo URL from PR URL: #{pr_url}"}
+    end
+  end
+
+  defp extract_repo_url(pr_url) do
+    case Regex.run(~r|^(https://github\.com/[^/]+/[^/]+)/pull/|, pr_url) do
+      [_, repo_url] -> {:ok, repo_url}
+      nil -> :error
     end
   end
 
