@@ -320,6 +320,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
       |> auto_promote_pass()
+      |> auto_merge_pass()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -395,6 +396,15 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, %{planner: %{auto_promote_children: true}}} -> true
       _ -> false
     end
+  end
+
+  defp auto_merge_pass(%State{} = state) do
+    case Config.settings() do
+      {:ok, config} -> SymphonyElixir.Planner.AutoMerge.scan_and_merge(config)
+      _ -> :ok
+    end
+
+    state
   end
 
   defp reconcile_running_issues(%State{} = state) do

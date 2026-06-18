@@ -13,8 +13,10 @@ defmodule SymphonyElixir.Planner.DescriptionNormalizer do
     * Repo intent: `create a new repo`, `new repo`, `create repo <name>`
     * Repo name: inferred from explicit `create repo <name>`, then description
       "build a X app" pattern, then the issue title
-    * Flags: `do not auto merge` / `don't auto merge` → `auto_merge: false`;
-      `auto merge` → `auto_merge: true`; default is `false`
+    * Flags: `do not auto merge` / `don't auto merge` / `manual review required` /
+      `human review required` → `auto_merge: false`; `auto merge` / `auto-merge` /
+      `automatically merge` / `merge child PRs after checks pass` → `auto_merge: true`;
+      default is `nil` (unset, not false — callers must handle nil as "no explicit intent")
     * Tech stack: `Next.js`, `Supabase`, `React`, `PostgreSQL`, `Tailwind`, `TypeScript`
 
   A `vibe: …` line in the description is parsed first (higher priority) before
@@ -35,7 +37,7 @@ defmodule SymphonyElixir.Planner.DescriptionNormalizer do
           node: String.t() | nil,
           node_id: String.t() | nil,
           agent: String.t() | nil,
-          auto_merge: boolean(),
+          auto_merge: boolean() | nil,
           human_review_required: boolean(),
           auto_promote_children: boolean(),
           tech_stack: [String.t()],
@@ -181,14 +183,14 @@ defmodule SymphonyElixir.Planner.DescriptionNormalizer do
     end
   end
 
-  defp detect_auto_merge(text) do
-    negative = ~r/\b(?:do\s+not|don'?t|no)\s+auto[\s_\-]?merge\b/i
-    positive = ~r/\bauto[\s_\-]?merge\b/i
+  @auto_merge_negative ~r/\b(?:do\s+not|don'?t|no)\s+(?:auto[\s_\-]?merge|automatically\s+merge)\b|\bmanual\s+review\s+required\b|\bhuman\s+review\s+(?:only|required)\b/i
+  @auto_merge_positive ~r/\bauto[\s_\-]?merge\b|\bautomatically\s+merge\b|\bmerge\s+child\s+(?:prs?|pull\s+requests?)\s+after\s+checks?\s+pass\b/i
 
+  defp detect_auto_merge(text) do
     cond do
-      Regex.match?(negative, text) -> false
-      Regex.match?(positive, text) -> true
-      true -> false
+      Regex.match?(@auto_merge_negative, text) -> false
+      Regex.match?(@auto_merge_positive, text) -> true
+      true -> nil
     end
   end
 

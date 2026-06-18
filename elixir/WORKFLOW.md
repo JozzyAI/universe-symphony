@@ -93,6 +93,17 @@ planner:
   # external.agent (which defaults to "mock"); always "codex" so the
   # planner gets a real planning turn, not the mock CLI simulation.
   agent: "codex"
+  auto_promote_children: true
+auto_merge:
+  # Global kill-switch. Set to true only after reviewing the allowed_repos list.
+  enabled: false
+  merge_method: squash
+  delete_branch: true
+  require_checks: true
+  allow_no_checks: false
+  # Repos that Symphony is permitted to auto-merge into. Full GitHub URL.
+  # Per-issue opt-in also required: description must contain `Auto merge: true`.
+  allowed_repos: []
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

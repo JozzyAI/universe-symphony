@@ -185,9 +185,9 @@ defmodule SymphonyElixir.Planner.DescriptionNormalizerTest do
   # ---------------------------------------------------------------------------
 
   describe "auto_merge flag" do
-    test "defaults to false" do
+    test "defaults to nil (unset) when not mentioned" do
       result = DescriptionNormalizer.normalize("some description", "Test", config())
-      assert result.auto_merge == false
+      assert result.auto_merge == nil
     end
 
     test "do not auto merge -> false" do
@@ -202,6 +202,46 @@ defmodule SymphonyElixir.Planner.DescriptionNormalizerTest do
 
     test "no auto merge -> false" do
       result = DescriptionNormalizer.normalize("no auto merge", "Test", config())
+      assert result.auto_merge == false
+    end
+
+    test "auto merge (simple positive) -> true" do
+      result = DescriptionNormalizer.normalize("auto merge this project.", "Test", config())
+      assert result.auto_merge == true
+    end
+
+    test "auto-merge -> true" do
+      result = DescriptionNormalizer.normalize("Use auto-merge.", "Test", config())
+      assert result.auto_merge == true
+    end
+
+    test "automatically merge -> true" do
+      result = DescriptionNormalizer.normalize("automatically merge PRs.", "Test", config())
+      assert result.auto_merge == true
+    end
+
+    test "merge child PRs after checks pass -> true" do
+      result = DescriptionNormalizer.normalize("Merge child PRs after checks pass.", "Test", config())
+      assert result.auto_merge == true
+    end
+
+    test "do not automatically merge -> false" do
+      result = DescriptionNormalizer.normalize("Do not automatically merge anything.", "Test", config())
+      assert result.auto_merge == false
+    end
+
+    test "manual review required -> false" do
+      result = DescriptionNormalizer.normalize("Manual review required for all changes.", "Test", config())
+      assert result.auto_merge == false
+    end
+
+    test "human review required -> false" do
+      result = DescriptionNormalizer.normalize("Human review required before merging.", "Test", config())
+      assert result.auto_merge == false
+    end
+
+    test "negative pattern wins over positive when both present" do
+      result = DescriptionNormalizer.normalize("do not auto merge child PRs after checks pass", "Test", config())
       assert result.auto_merge == false
     end
   end
