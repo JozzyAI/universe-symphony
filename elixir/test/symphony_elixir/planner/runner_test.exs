@@ -36,6 +36,11 @@ defmodule SymphonyElixir.Planner.RunnerTest do
       end
     end
 
+    def graphql(mutation, vars) do
+      send(self(), {:graphql_called, mutation, vars})
+      {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+    end
+
     def fetch_team_states(team_id) do
       send(self(), {:fetch_team_states_called, team_id})
 
@@ -68,6 +73,10 @@ defmodule SymphonyElixir.Planner.RunnerTest do
 
       case String.downcase(label_name) do
         "bug" -> {:ok, "label-bug"}
+        "agent:claude-code" -> {:ok, "label-agent-claude-code"}
+        "agent:codex" -> {:ok, "label-agent-codex"}
+        "node:joey-pc" -> {:ok, "label-node-joey-pc"}
+        "repo:mirror_social" -> {:ok, "label-repo-mirror-social"}
         _ -> {:error, :label_not_found}
       end
     end
@@ -561,6 +570,156 @@ defmodule SymphonyElixir.Planner.RunnerTest do
 
       assert output == "intro\n```json\n{\"children\": []}\n```"
       assert {:ok, %{"children" => []}} = PlanExtractor.extract_json_block(output)
+    end
+  end
+
+  # ── Human Description Normalizer + Project Memory integration ────────────
+
+  describe "description normalization and project memory" do
+    setup do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        planner_enabled: true,
+        planner_trigger_label: "type:plan",
+        planner_child_initial_state: "Backlog",
+        planner_max_children: 10,
+        planner_agent: "codex",
+        binding: remote_binding_yaml()
+      )
+
+      :ok
+    end
+
+    test "parent description is updated with project memory block before children are created" do
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue =
+        parent_issue(
+          title: "Mirror Social",
+          description: """
+          I want to build a Mirror Social app.
+          vibe: create a new repo use joey_pc use claude code
+          Do not auto merge.
+          """
+        )
+
+      assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:memory_tracker_description_update, "parent-1", new_desc}
+      assert new_desc =~ "<!-- symphony:project-memory:v1:start -->"
+      assert new_desc =~ "<!-- symphony:project-memory:v1:end -->"
+    end
+
+    test "project memory block contains normalized binding values" do
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue =
+        parent_issue(
+          title: "Mirror Social",
+          description: """
+          vibe: create a new repo use joey_pc use claude code
+          Do not auto merge.
+          """
+        )
+
+      assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:memory_tracker_description_update, "parent-1", new_desc}
+      assert new_desc =~ "repo_name: mirror_social"
+      assert new_desc =~ "node: joey-pc"
+      assert new_desc =~ "agent: claude-code"
+      assert new_desc =~ "auto_merge: false"
+      assert new_desc =~ "human_review_required: true"
+    end
+
+    test "child issues receive inherited agent: and node: labels from normalized binding" do
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue =
+        parent_issue(
+          title: "Mirror Social",
+          description: "vibe: create a new repo use joey_pc use claude code"
+        )
+
+      assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:create_issue_called, attrs}
+      assert "label-agent-claude-code" in (attrs[:label_ids] || [])
+      assert "label-node-joey-pc" in (attrs[:label_ids] || [])
+    end
+
+    test "child issues include inherited project memory block in description" do
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue =
+        parent_issue(
+          title: "Mirror Social",
+          description: "vibe: create a new repo use joey_pc use claude code"
+        )
+
+      assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:create_issue_called, attrs}
+      assert attrs.description =~ "<!-- symphony:inherited-project-memory:v1:start -->"
+      assert attrs.description =~ "<!-- symphony:inherited-project-memory:v1:end -->"
+      assert attrs.description =~ "Parent: JOZ-1"
+      assert attrs.description =~ "joey-pc"
+      assert attrs.description =~ "claude-code"
+    end
+
+    test "child issues do not receive type:plan label" do
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue =
+        parent_issue(
+          title: "Mirror Social",
+          description: "vibe: use joey_pc use claude code"
+        )
+
+      assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:create_issue_called, attrs}
+      refute "type:plan" in (attrs[:label_ids] || [])
+    end
+
+    test "auto_merge defaults false even when not explicitly stated" do
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue = parent_issue(title: "Test", description: "vibe: use joey_pc use codex")
+
+      assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:memory_tracker_description_update, "parent-1", new_desc}
+      assert new_desc =~ "auto_merge: false"
+    end
+
+    test "human_review_required defaults true" do
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue = parent_issue(title: "Test", description: "vibe: use joey_pc use codex")
+
+      assert {:ok, {:created_children, _}} = Runner.run(issue, recipient: self())
+
+      assert_receive {:memory_tracker_description_update, "parent-1", new_desc}
+      assert new_desc =~ "human_review_required: true"
+    end
+
+    test "description update does not prevent child creation when tracker returns error" do
+      Application.put_env(
+        :symphony_elixir,
+        :memory_tracker_update_issue_description_result,
+        {:error, :update_failed}
+      )
+
+      Application.put_env(:symphony_elixir, :fake_executor_result, {:ok, planner_output(["Child A"])})
+
+      issue = parent_issue(title: "Test", description: "vibe: use joey_pc use codex")
+
+      assert {:ok, {:created_children, [_identifier]}} = Runner.run(issue, recipient: self())
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :memory_tracker_update_issue_description_result)
+      end)
     end
   end
 

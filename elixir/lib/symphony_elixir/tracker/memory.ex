@@ -53,6 +53,19 @@ defmodule SymphonyElixir.Tracker.Memory do
     end
   end
 
+  @spec update_issue_description(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_issue_description(issue_id, description)
+      when is_binary(issue_id) and is_binary(description) do
+    case Application.get_env(:symphony_elixir, :memory_tracker_update_issue_description_result, :ok) do
+      :ok ->
+        send_event({:memory_tracker_description_update, issue_id, description})
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end

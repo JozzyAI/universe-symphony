@@ -23,6 +23,14 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @update_description_mutation """
+  mutation SymphonyUpdateIssueDescription($issueId: String!, $description: String!) {
+    issueUpdate(id: $issueId, input: {description: $description}) {
+      success
+    }
+  }
+  """
+
   @state_lookup_query """
   query SymphonyResolveStateId($issueId: String!, $stateName: String!) {
     issue(id: $issueId) {
@@ -95,6 +103,23 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @spec fetch_issue_children(String.t()) :: {:ok, [map()]} | {:error, term()}
   def fetch_issue_children(issue_id) when is_binary(issue_id), do: client_module().fetch_issue_children(issue_id)
+
+  @spec update_issue_description(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_issue_description(issue_id, description)
+      when is_binary(issue_id) and is_binary(description) do
+    with {:ok, response} <-
+           client_module().graphql(@update_description_mutation, %{
+             issueId: issue_id,
+             description: description
+           }),
+         true <- get_in(response, ["data", "issueUpdate", "success"]) == true do
+      :ok
+    else
+      false -> {:error, :issue_update_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :issue_update_failed}
+    end
+  end
 
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)

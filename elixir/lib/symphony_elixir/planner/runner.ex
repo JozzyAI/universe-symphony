@@ -28,7 +28,7 @@ defmodule SymphonyElixir.Planner.Runner do
   alias SymphonyElixir.{Binding, Config, Redact, Tracker}
   alias SymphonyElixir.Codex.ExternalExecutor
   alias SymphonyElixir.Linear.{Adapter, Issue}
-  alias SymphonyElixir.Planner.{PlanExtractor, Prompt}
+  alias SymphonyElixir.Planner.{DescriptionNormalizer, PlanExtractor, ProjectMemory, Prompt}
 
   @marker_prefix "<!-- symphony-planner:v1"
   @human_review_state "Human Review"
@@ -144,6 +144,11 @@ defmodule SymphonyElixir.Planner.Runner do
     config = Config.settings!()
     planner_config = config.planner
 
+    # Normalize the parent description and write project memory before planning.
+    normalized_binding = DescriptionNormalizer.normalize(issue.description, issue.title, config)
+    updated_description = ProjectMemory.write(issue.description, normalized_binding, issue.title)
+    issue = maybe_update_description(issue, updated_description)
+
     case Binding.resolve(issue, config) do
       {:ok, binding} ->
         repo_url = binding_repo_url(binding)
@@ -156,7 +161,7 @@ defmodule SymphonyElixir.Planner.Runner do
                 if length(children) > planner_config.max_children do
                   fail_run(issue, {:too_many_children, length(children), planner_config.max_children})
                 else
-                  create_children(issue, children, existing_children, repo_url, planner_config)
+                  create_children(issue, children, existing_children, repo_url, planner_config, normalized_binding)
                 end
 
               {:error, reason} ->
@@ -169,6 +174,24 @@ defmodule SymphonyElixir.Planner.Runner do
 
       {:error, reason} ->
         fail_run(issue, {:binding_resolution_failed, reason})
+    end
+  end
+
+  defp maybe_update_description(issue, new_description) do
+    if new_description != (issue.description || "") do
+      case Tracker.update_issue_description(issue.id, new_description) do
+        :ok ->
+          %{issue | description: new_description}
+
+        {:error, reason} ->
+          Logger.warning(
+            "PlannerRunner: failed to update description for #{issue_context(issue)}: #{inspect(Redact.redact(reason))}"
+          )
+
+          issue
+      end
+    else
+      issue
     end
   end
 
@@ -256,10 +279,10 @@ defmodule SymphonyElixir.Planner.Runner do
 
   # ── Child issue creation ─────────────────────────────────────────────────
 
-  defp create_children(issue, children, existing_children, repo_url, planner_config) do
+  defp create_children(issue, children, existing_children, repo_url, planner_config, normalized_binding) do
     case resolve_child_state_id(issue, planner_config.child_initial_state) do
       {:ok, state_id} ->
-        do_create_children(issue, children, existing_children, repo_url, state_id)
+        do_create_children(issue, children, existing_children, repo_url, state_id, normalized_binding)
 
       {:error, reason} ->
         fail_run(issue, {:state_resolution_failed, planner_config.child_initial_state, reason})
@@ -275,7 +298,7 @@ defmodule SymphonyElixir.Planner.Runner do
   # Reuses children from a previous partial run (matched by title) instead of
   # creating duplicates, and stops at the first creation failure so a retry
   # has a well-defined, non-duplicated starting point.
-  defp do_create_children(issue, children, existing_children, repo_url, state_id) do
+  defp do_create_children(issue, children, existing_children, repo_url, state_id, normalized_binding) do
     existing_by_title = Map.new(existing_children, fn child -> {normalize_title(child.title), child} end)
 
     result =
@@ -285,7 +308,7 @@ defmodule SymphonyElixir.Planner.Runner do
             {:cont, {:ok, [existing.identifier || existing.id | acc]}}
 
           nil ->
-            case create_child_issue(issue, child, repo_url, state_id) do
+            case create_child_issue(issue, child, repo_url, state_id, normalized_binding) do
               {:ok, identifier} -> {:cont, {:ok, [identifier | acc]}}
               {:error, reason} -> {:halt, {:error, reason, acc}}
             end
@@ -304,17 +327,21 @@ defmodule SymphonyElixir.Planner.Runner do
   defp normalize_title(title) when is_binary(title), do: title |> String.trim() |> String.downcase()
   defp normalize_title(_title), do: ""
 
-  defp create_child_issue(issue, child, repo_url, state_id) do
+  defp create_child_issue(issue, child, repo_url, state_id, normalized_binding) do
+    binding_labels = DescriptionNormalizer.child_labels(normalized_binding)
+    all_labels = (child.labels || []) ++ binding_labels
+    inherited_block = ProjectMemory.build_inherited_block(normalized_binding, issue.identifier)
+
     attrs =
       %{
         team_id: issue.team_id,
         parent_id: issue.id,
         title: child.title,
-        description: build_child_description(child, repo_url),
+        description: build_child_description(child, repo_url, inherited_block),
         state_id: state_id
       }
       |> maybe_put(:project_id, issue.project_id)
-      |> maybe_put(:label_ids, resolve_label_ids(issue.team_id, child.labels))
+      |> maybe_put(:label_ids, resolve_label_ids(issue.team_id, all_labels))
 
     case Adapter.create_issue(attrs) do
       {:ok, %{identifier: identifier}} when is_binary(identifier) -> {:ok, identifier}
@@ -340,14 +367,15 @@ defmodule SymphonyElixir.Planner.Runner do
 
   defp resolve_label_ids(_team_id, _labels), do: []
 
-  defp build_child_description(child, repo_url) do
+  defp build_child_description(child, repo_url, inherited_block) do
     acceptance = Enum.map_join(child.acceptance_criteria, "\n", &"- #{&1}")
 
     [
       child.description,
       "## Acceptance criteria\n\n#{acceptance}",
       "Open a PR, do not merge.",
-      repo_binding_note(repo_url)
+      repo_binding_note(repo_url),
+      inherited_block
     ]
     |> Enum.reject(&(&1 in [nil, ""]))
     |> Enum.join("\n\n")
