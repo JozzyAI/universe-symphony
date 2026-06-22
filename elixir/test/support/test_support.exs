@@ -183,6 +183,8 @@ defmodule SymphonyElixir.TestSupport do
     external_command = Keyword.get(config, :external_command)
     external_agent = Keyword.get(config, :external_agent)
     external_node = Keyword.get(config, :external_node)
+    external_relay = Keyword.get(config, :external_relay)
+    external_token = Keyword.get(config, :external_token)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -242,6 +244,8 @@ defmodule SymphonyElixir.TestSupport do
         "  command: #{yaml_value(external_command)}",
         "  agent: #{yaml_value(external_agent)}",
         "  node: #{yaml_value(external_node)}",
+        external_relay && "  relay: #{yaml_value(external_relay)}",
+        external_token && "  token: #{yaml_value(external_token)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
