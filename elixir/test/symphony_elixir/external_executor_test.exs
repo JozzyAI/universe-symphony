@@ -537,4 +537,237 @@ defmodule SymphonyElixir.ExternalExecutorTest do
 
     assert Config.settings!().planner.agent == "claude-code"
   end
+
+  # ── Relay token argv hygiene (no --token <value> in any spawned process) ───
+
+  describe "relay token never appears in argv (token-file hygiene)" do
+    # Fake vibe that records every invocation's full argv, plus -- when
+    # --token-file is present -- the file's path and content at the moment
+    # of invocation (the file still exists then; it is shredded+deleted only
+    # after the call returns, so this is the only point a test can observe
+    # it). One line per field, parsed by `parse_recorded_calls/1`.
+    defp vibe_recording_relay_calls!(marker_path) do
+      write_fake_vibe!(~s"""
+      SUBCOMMAND="$1"
+      ACTION="$2"
+      {
+        echo "CALL $SUBCOMMAND-$ACTION"
+        for a in "$@"; do echo "ARG $a"; done
+        PREV=""
+        for a in "$@"; do
+          if [ "$PREV" = "--token-file" ]; then
+            echo "TOKENFILE_PATH $a"
+            echo "TOKENFILE_CONTENT $(cat "$a" 2>/dev/null)"
+          fi
+          PREV="$a"
+        done
+        echo "END"
+      } >> #{marker_path}
+      case "$SUBCOMMAND-$ACTION" in
+        symphony-start)
+          echo '{"run_id":"rec-run-1","session_id":"sess-rec","node_id":"node_test123","agent":"claude-code","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
+          ;;
+        symphony-stream)
+          RUN_ID="${3:-rec-run-1}"
+          echo "{\\"type\\":\\"status\\",\\"status\\":\\"completed\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:03Z\\"}"
+          ;;
+        symphony-status)
+          echo '{"run_id":"rec-run-1","status":"completed"}'
+          ;;
+        symphony-stop)
+          echo '{"status":"stopped"}'
+          ;;
+        approval-respond)
+          echo '{"approval_id":"appr-1","decision":"deny"}'
+          ;;
+        *)
+          exit 1
+          ;;
+      esac
+      """)
+    end
+
+    defp parse_recorded_calls(marker_path) do
+      marker_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.reduce([], fn line, acc ->
+        cond do
+          String.starts_with?(line, "CALL ") ->
+            [%{call: String.replace_prefix(line, "CALL ", ""), args: [], token_file_path: nil, token_file_content: nil} | acc]
+
+          String.starts_with?(line, "ARG ") ->
+            [current | rest] = acc
+            [%{current | args: current.args ++ [String.replace_prefix(line, "ARG ", "")]} | rest]
+
+          String.starts_with?(line, "TOKENFILE_PATH ") ->
+            [current | rest] = acc
+            [%{current | token_file_path: String.replace_prefix(line, "TOKENFILE_PATH ", "")} | rest]
+
+          String.starts_with?(line, "TOKENFILE_CONTENT ") ->
+            [current | rest] = acc
+            [%{current | token_file_content: String.replace_prefix(line, "TOKENFILE_CONTENT ", "")} | rest]
+
+          true ->
+            acc
+        end
+      end)
+      |> Enum.reverse()
+    end
+
+    defp find_call(calls, name), do: Enum.find(calls, &(&1.call == name))
+
+    test "start + stream: forward --node/--relay/--token-file, never literal --token; the file carries the real token; both files are gone after" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+
+      assert :ok =
+               ExternalExecutor.run(fake_issue(), "prompt", "/tmp",
+                 command: cmd,
+                 agent: "claude-code",
+                 node: "node_test123",
+                 relay: "ws://fake-relay.invalid",
+                 token: "super-secret-start-stream-token",
+                 repo_url: "https://github.com/JozzyAI/mirror_social"
+               )
+
+      calls = parse_recorded_calls(marker)
+      start_call = find_call(calls, "symphony-start")
+      stream_call = find_call(calls, "symphony-stream")
+
+      for call <- [start_call, stream_call] do
+        refute Enum.member?(call.args, "--token")
+        assert Enum.member?(call.args, "--token-file")
+        assert call.token_file_content == "super-secret-start-stream-token"
+        refute File.exists?(call.token_file_path)
+      end
+
+      assert Enum.member?(start_call.args, "--node")
+      assert Enum.member?(start_call.args, "--relay")
+    end
+
+    test "query_run_status: forwards --relay/--token-file, never literal --token; status query still works; file is gone after" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+
+      assert {:ok, %{status: "completed"}} =
+               ExternalExecutor.query_run_status(cmd, "some-run-id", "ws://fake-relay.invalid", "status-secret-xyz")
+
+      status_call = parse_recorded_calls(marker) |> find_call("symphony-status")
+
+      refute Enum.member?(status_call.args, "--token")
+      assert Enum.member?(status_call.args, "--relay")
+      assert Enum.member?(status_call.args, "--token-file")
+      assert status_call.token_file_content == "status-secret-xyz"
+      refute File.exists?(status_call.token_file_path)
+    end
+
+    test "stop_run: forwards --relay/--token-file, never literal --token; file is gone after" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+
+      ExternalExecutor.stop_run(cmd, "some-run-id", "ws://fake-relay.invalid", "stop-secret-abc")
+
+      stop_call = parse_recorded_calls(marker) |> find_call("symphony-stop")
+
+      refute Enum.member?(stop_call.args, "--token")
+      assert Enum.member?(stop_call.args, "--token-file")
+      assert stop_call.token_file_content == "stop-secret-abc"
+      refute File.exists?(stop_call.token_file_path)
+    end
+
+    test "send_approval: forwards --relay/--token-file, never literal --token" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+
+      assert {:ok, _result} =
+               ExternalExecutor.send_approval(cmd, "run-1", "appr-1", "deny", "ws://fake-relay.invalid", "approval-secret-1")
+
+      approval_call = parse_recorded_calls(marker) |> find_call("approval-respond")
+
+      refute Enum.member?(approval_call.args, "--token")
+      assert Enum.member?(approval_call.args, "--token-file")
+      assert approval_call.token_file_content == "approval-secret-1"
+      refute File.exists?(approval_call.token_file_path)
+    end
+
+    test "nil token: --node/--relay are still forwarded (no silent local fallback); no --token or --token-file at all" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+
+      assert :ok =
+               ExternalExecutor.run(fake_issue(), "prompt", "/tmp",
+                 command: cmd,
+                 agent: "claude-code",
+                 node: "node_test123",
+                 relay: "ws://fake-relay.invalid",
+                 token: nil,
+                 repo_url: "https://github.com/JozzyAI/mirror_social"
+               )
+
+      start_call = parse_recorded_calls(marker) |> find_call("symphony-start")
+
+      assert Enum.member?(start_call.args, "--node")
+      assert Enum.member?(start_call.args, "--relay")
+      refute Enum.member?(start_call.args, "--token")
+      refute Enum.member?(start_call.args, "--token-file")
+    end
+
+    test "blank token is treated as absent: no --token or --token-file, remote flags retained" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+
+      assert :ok =
+               ExternalExecutor.run(fake_issue(), "prompt", "/tmp",
+                 command: cmd,
+                 agent: "claude-code",
+                 node: "node_test123",
+                 relay: "ws://fake-relay.invalid",
+                 token: "",
+                 repo_url: "https://github.com/JozzyAI/mirror_social"
+               )
+
+      start_call = parse_recorded_calls(marker) |> find_call("symphony-start")
+
+      assert Enum.member?(start_call.args, "--node")
+      assert Enum.member?(start_call.args, "--relay")
+      refute Enum.member?(start_call.args, "--token")
+      refute Enum.member?(start_call.args, "--token-file")
+    end
+
+    test "no relay/node: pure local dispatch adds no relay flags and writes no token file" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+
+      assert :ok = ExternalExecutor.run(fake_issue(), "prompt", "/tmp", command: cmd, agent: "mock")
+
+      start_call = parse_recorded_calls(marker) |> find_call("symphony-start")
+
+      refute Enum.member?(start_call.args, "--node")
+      refute Enum.member?(start_call.args, "--relay")
+      refute Enum.member?(start_call.args, "--token")
+      refute Enum.member?(start_call.args, "--token-file")
+    end
+
+    test "no secrets in logs: the relay token never appears in captured Logger output" do
+      marker = Path.join(System.tmp_dir!(), "vibe-relay-calls-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_relay_calls!(marker)
+      sentinel = "LOG_SENTINEL_TOKEN_#{System.unique_integer([:positive])}"
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok =
+                   ExternalExecutor.run(fake_issue(), "prompt", "/tmp",
+                     command: cmd,
+                     agent: "claude-code",
+                     node: "node_test123",
+                     relay: "ws://fake-relay.invalid",
+                     token: sentinel,
+                     repo_url: "https://github.com/JozzyAI/mirror_social"
+                   )
+        end)
+
+      refute log =~ sentinel
+    end
+  end
 end
