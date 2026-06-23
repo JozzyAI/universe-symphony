@@ -733,21 +733,11 @@ defmodule SymphonyElixir.Orchestrator do
         |> stop_and_block_issue(issue_id, running_entry, error)
       else
         if agent_kind_vibe?() do
-          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; querying Vibe run status before moving to Human Review")
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; querying authoritative Vibe run status before moving to Human Review")
 
-          issue = running_entry.issue
-          vibe_run_id = Map.get(running_entry, :vibe_run_id)
-          vibe_stream_os_pid = Map.get(running_entry, :vibe_stream_os_pid)
-          reason_text = query_vibe_stall_reason(vibe_run_id, elapsed_ms)
+          log_ctx = "issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}"
 
-          result_state =
-            state
-            |> terminate_running_issue(issue_id, false)
-            |> finish_issue_without_pr(issue_id, issue, reason_text)
-
-          maybe_stop_vibe_run(vibe_run_id)
-          maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
-          result_state
+          reconcile_vibe_stall(state, issue_id, running_entry, elapsed_ms, log_ctx)
         else
           Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
 
@@ -1459,11 +1449,104 @@ defmodule SymphonyElixir.Orchestrator do
     |> release_issue_claim(issue_id)
   end
 
-  # Queries the Vibe run status when the stream went silent before a stall fires.
-  # Returns a human-readable reason string for the Human Review comment.
-  # Falls back to the generic stall wording if the run_id is absent or the
-  # status query fails — preserving the original behavior for true stalls.
-  defp query_vibe_stall_reason(vibe_run_id, elapsed_ms) when is_binary(vibe_run_id) do
+  # Node-authoritative stall reconciliation for Vibe runs.
+  #
+  # The stream going silent is NOT proof of a stall: the run may have completed
+  # or failed on the node while relay event delivery dropped (the JOZ-37
+  # connected-but-silent false-stall). So before parking the issue, ask the
+  # owning node — over the same relay/token used to start/stream the run — what
+  # actually happened, and reconcile Linear to the real outcome.
+  #
+  # Safety: this never starts a new run or re-dispatches; it only transitions
+  # Linear through the existing finish_* paths and tears down lingering
+  # stop/stream processes. The relay token lives only in argv (never logged or
+  # returned by query_run_status), so no secret enters comments or logs here.
+  defp reconcile_vibe_stall(state, issue_id, running_entry, elapsed_ms, log_ctx) do
+    issue = running_entry.issue
+    vibe_run_id = Map.get(running_entry, :vibe_run_id)
+    vibe_stream_os_pid = Map.get(running_entry, :vibe_stream_os_pid)
+
+    case query_vibe_run_status(vibe_run_id) do
+      {:completed, pr_url} when is_binary(pr_url) and pr_url != "" ->
+        Logger.info("Vibe watchdog: #{log_ctx}; node reports COMPLETED with PR — reconciling as success (not a stall)")
+
+        result_state =
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> finish_issue_with_pr(issue_id, running_entry, pr_url)
+
+        # The run already finished on the node; only clean up a lingering stream.
+        maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
+        result_state
+
+      {:completed, _no_pr} ->
+        Logger.info("Vibe watchdog: #{log_ctx}; node reports COMPLETED (no PR url) — reconciling as completed, not a stall")
+
+        result_state =
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> finish_issue_without_pr(
+            issue_id,
+            issue,
+            "Vibe run completed, but stream events were not received before the stall timeout. " <>
+              "A pull request may already exist for this issue. Please check the repository manually."
+          )
+
+        maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
+        result_state
+
+      {:failed, node_reason} ->
+        Logger.warning("Vibe watchdog: #{log_ctx}; node reports FAILED — reconciling as failure")
+
+        result_state =
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> finish_issue_without_pr(issue_id, issue, "Vibe run failed before completion: #{node_reason}")
+
+        maybe_stop_vibe_run(vibe_run_id)
+        maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
+        result_state
+
+      {:running, _} ->
+        Logger.warning("Issue stalled: #{log_ctx}; node still reports the run RUNNING but no stream activity — moving to Human Review (Vibe is single-shot)")
+
+        result_state =
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> finish_issue_without_pr(
+            issue_id,
+            issue,
+            "agent run stalled for #{elapsed_ms}ms without activity (the node still reports the run as running)."
+          )
+
+        maybe_stop_vibe_run(vibe_run_id)
+        maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
+        result_state
+
+      {:unknown, diagnostic} ->
+        Logger.warning("Issue stalled: #{log_ctx}; node/relay status query inconclusive (#{diagnostic}) — moving to Human Review")
+
+        result_state =
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> finish_issue_without_pr(
+            issue_id,
+            issue,
+            "agent run watchdog fired after #{elapsed_ms}ms; the node/relay run-status query was inconclusive " <>
+              "(#{diagnostic}), so completion could not be confirmed — please verify the run and repository manually."
+          )
+
+        maybe_stop_vibe_run(vibe_run_id)
+        maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
+        result_state
+    end
+  end
+
+  # Authoritative node/relay status for a (seemingly) stalled Vibe run, mapped to
+  # a reconcilable outcome. Missing run_id or any query error degrades to
+  # {:unknown, _} so the caller falls back to Human Review rather than silently
+  # false-parking — preserving the conservative behavior for genuine stalls.
+  defp query_vibe_run_status(vibe_run_id) when is_binary(vibe_run_id) do
     config = Config.settings!()
 
     case SymphonyElixir.Codex.ExternalExecutor.query_run_status(
@@ -1472,17 +1555,42 @@ defmodule SymphonyElixir.Orchestrator do
            config.external.relay,
            config.external.token
          ) do
-      {:ok, %{status: "completed"}} ->
-        "Vibe run completed, but stream events were not received before the stall timeout. " <>
-          "A pull request may already exist for this issue. Please check the repository manually."
+      {:ok, %{status: "completed"} = result} ->
+        {:completed, Map.get(result, :pr_url)}
 
-      _ ->
-        "agent run stalled for #{elapsed_ms}ms without activity."
+      {:ok, %{status: status} = result} when status in ["failed", "stopped", "cancelled"] ->
+        {:failed, vibe_failure_reason(status, Map.get(result, :error))}
+
+      {:ok, %{status: "running"}} ->
+        {:running, nil}
+
+      {:ok, %{status: other}} ->
+        {:unknown, "node returned status=#{other}"}
+
+      {:error, reason} ->
+        {:unknown, safe_status_error(reason)}
     end
   end
 
-  defp query_vibe_stall_reason(_vibe_run_id, elapsed_ms) do
-    "agent run stalled for #{elapsed_ms}ms without activity."
+  defp query_vibe_run_status(_vibe_run_id) do
+    {:unknown, "no Vibe run_id was recorded for this issue"}
+  end
+
+  defp vibe_failure_reason(status, error) when is_binary(error) and error != "" do
+    "#{status} — #{String.slice(error, 0, 300)}"
+  end
+
+  defp vibe_failure_reason(status, _error), do: status
+
+  # The status-query error term is an internal tuple (exit code / command name /
+  # JSON decode error) and carries no secret — the relay token only ever lives
+  # in argv, never in query_run_status output. Redact defensively, inspect, and
+  # bound the length before it can reach a Linear comment or log line.
+  defp safe_status_error(reason) do
+    reason
+    |> SymphonyElixir.Redact.redact()
+    |> inspect()
+    |> String.slice(0, 200)
   end
 
   # Stops the Vibe relay run after a stall so any lingering stream process can

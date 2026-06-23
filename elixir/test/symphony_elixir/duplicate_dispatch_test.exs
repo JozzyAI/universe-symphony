@@ -266,7 +266,10 @@ defmodule SymphonyElixir.DuplicateDispatchTest do
 
       assert_receive {:memory_tracker_comment, ^issue_id, comment}, 1_000
       assert comment =~ "Human Review"
-      assert comment =~ "stalled"
+      # The authoritative run-status query cannot confirm completion for an
+      # unknown run_id, so the watchdog reports an inconclusive diagnostic
+      # rather than a bare "stalled" — but the issue is still parked, not retried.
+      assert comment =~ "could not be confirmed"
 
       assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
 

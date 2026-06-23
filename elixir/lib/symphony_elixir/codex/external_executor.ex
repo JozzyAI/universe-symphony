@@ -335,7 +335,8 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   end
 
   @spec query_run_status(String.t(), String.t(), String.t() | nil, String.t() | nil) ::
-          {:ok, %{status: String.t()}} | {:error, term()}
+          {:ok, %{status: String.t(), pr_url: String.t() | nil, error: String.t() | nil}}
+          | {:error, term()}
   def query_run_status(command, run_id, relay, token)
       when is_binary(command) and is_binary(run_id) do
     args =
@@ -346,8 +347,13 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
       case System.cmd(command, args, stderr_to_stdout: false) do
         {output, 0} ->
           case Jason.decode(String.trim(output)) do
-            {:ok, %{"status" => status}} when is_binary(status) ->
-              {:ok, %{status: status}}
+            {:ok, %{"status" => status} = record} when is_binary(status) ->
+              {:ok,
+               %{
+                 status: status,
+                 pr_url: Map.get(record, "pr_url"),
+                 error: Map.get(record, "error")
+               }}
 
             {:ok, other} ->
               {:error, {:unexpected_status_response, other}}
@@ -409,19 +415,33 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
 
   def kill_stream_process(_os_pid, _run_id), do: :ok
 
+  # Remote dispatch is determined by node + relay, NOT by the auth token: the
+  # vibe CLI also resolves the relay token from its own VIBE_RELAY_TOKEN env (see
+  # resolveRelayToken / `--token` help text), and the worker daemon runs with no
+  # `--token` at all. So a nil/blank token must never silently drop --node/--relay
+  # and fall back to LOCAL mode — that produced `{:start_failed, 1, ""}` (vibe ran
+  # locally, found no such node, exited 1 with JSON on stdout / empty stderr).
+  # We forward --node/--relay whenever both are present, and append --token only
+  # when we actually have one (otherwise the client uses its env token, or fails
+  # loudly on the relay side instead of degrading to local).
   defp append_relay_args(args, node, relay, token)
-       when is_binary(node) and is_binary(relay) and is_binary(token) do
-    args ++ ["--node", node, "--relay", relay, "--token", token]
+       when is_binary(node) and node != "" and is_binary(relay) and relay != "" do
+    (args ++ ["--node", node, "--relay", relay]) |> maybe_append_token(token)
   end
 
   defp append_relay_args(args, _node, _relay, _token), do: args
 
-  defp append_relay_stream_args(args, relay, token)
-       when is_binary(relay) and is_binary(token) do
-    args ++ ["--relay", relay, "--token", token]
+  defp append_relay_stream_args(args, relay, token) when is_binary(relay) and relay != "" do
+    (args ++ ["--relay", relay]) |> maybe_append_token(token)
   end
 
   defp append_relay_stream_args(args, _relay, _token), do: args
+
+  defp maybe_append_token(args, token) when is_binary(token) and token != "" do
+    args ++ ["--token", token]
+  end
+
+  defp maybe_append_token(args, _token), do: args
 
   # Only add --encrypt when relay is configured and encrypt is explicitly true.
   # Encrypting local runs has no effect (no relay to be blind to the payload).

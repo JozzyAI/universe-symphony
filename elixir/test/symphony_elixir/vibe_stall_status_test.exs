@@ -1,17 +1,22 @@
 defmodule SymphonyElixir.VibeStallStatusTest do
   @moduledoc """
-  Tests for the Vibe silent-stream stall-path status fallback introduced to fix
-  the JOZ-24 discrepancy: when a `vibe symphony stream` process receives no
-  events and the stall timeout fires, Symphony now queries `vibe symphony
-  status` before choosing the Human Review comment.
+  Tests for node-authoritative Vibe stall reconciliation (JOZ-37): when a `vibe
+  symphony stream` process receives no events and the stall timeout fires,
+  Symphony queries the authoritative node/relay run status via `vibe symphony
+  status` before deciding the outcome, instead of false-parking the issue.
 
-  - If the run completed, a "stream events not received" comment is posted
-    instead of the misleading "stalled without activity" wording.
-  - If the run is still running, unknown, or the status query fails, the
-    existing "stalled without activity" comment is preserved.
+  - Node `completed` WITH a PR → reconcile as success (PR-ready comment), not a
+    stall.
+  - Node `completed` WITHOUT a PR → "stream events not received" comment, not the
+    misleading "stalled without activity" wording.
+  - Node `failed` → failure comment carrying the node-reported reason.
+  - Node `running` → the run really did stall: existing "stalled" wording.
+  - Status query inconclusive (query error / no run_id / unexpected status) →
+    explicit "watchdog fired / could not be confirmed" diagnostic rather than a
+    silent false-stall.
+  - No secrets (relay token) ever appear in the posted comment.
   - The happy path (pr_created + completed events arrive via the stream) is
-    unchanged.
-  - PlannerRunner dispatch is unaffected.
+    unchanged. PlannerRunner dispatch is unaffected.
   """
 
   use SymphonyElixir.TestSupport
@@ -70,6 +75,45 @@ defmodule SymphonyElixir.VibeStallStatusTest do
   defp vibe_status_failure! do
     write_fake_vibe!(~s"""
     exit 1
+    """)
+  end
+
+  # Fake vibe: `symphony status` returns completed WITH a pr_url, simulating a
+  # run that finished (and opened a PR) on the node while the stream went silent.
+  defp vibe_status_completed_with_pr! do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    case "$SUBCOMMAND-$ACTION" in
+      symphony-status)
+        echo '{"run_id":"run_test_stall","status":"completed","pr_url":"https://github.com/org/repo/pull/7"}'
+        ;;
+      symphony-stop)
+        echo '{"status":"stopped"}'
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    """)
+  end
+
+  # Fake vibe: `symphony status` returns failed with an error message.
+  defp vibe_status_failed! do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    case "$SUBCOMMAND-$ACTION" in
+      symphony-status)
+        echo '{"run_id":"run_test_stall","status":"failed","error":"agent crashed: out of memory"}'
+        ;;
+      symphony-stop)
+        echo '{"status":"stopped"}'
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
     """)
   end
 
@@ -228,8 +272,59 @@ defmodule SymphonyElixir.VibeStallStatusTest do
     end
   end
 
-  describe "vibe stall + status query failure" do
-    test "falls back to stall wording, moves to Human Review, does not crash" do
+  describe "vibe stall + status: completed with a PR" do
+    test "reconciles as success with a PR-ready comment, not a stall" do
+      pid = start_orchestrator_with_stall(vibe_status_completed_with_pr!())
+      issue_id = "issue-stall-completed-pr-#{System.unique_integer([:positive])}"
+      worker_pid = inject_stalled_running_entry(pid, issue_id, "run_test_stall")
+
+      send(pid, :tick)
+
+      assert_receive {:memory_tracker_comment, ^issue_id, comment}, 2_000
+      assert comment =~ "PR ready for review"
+      assert comment =~ "https://github.com/org/repo/pull/7"
+      refute comment =~ "stalled"
+      refute comment =~ "stream events were not received"
+
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
+
+      state = :sys.get_state(pid)
+
+      refute Process.alive?(worker_pid)
+      refute Map.has_key?(state.running, issue_id)
+      assert MapSet.member?(state.completed, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
+      refute Map.has_key?(state.retry_attempts, issue_id)
+    end
+  end
+
+  describe "vibe stall + status: failed" do
+    test "reconciles as failure carrying the node-reported reason" do
+      pid = start_orchestrator_with_stall(vibe_status_failed!())
+      issue_id = "issue-stall-failed-#{System.unique_integer([:positive])}"
+      worker_pid = inject_stalled_running_entry(pid, issue_id, "run_test_stall")
+
+      send(pid, :tick)
+
+      assert_receive {:memory_tracker_comment, ^issue_id, comment}, 2_000
+      assert comment =~ "Vibe run failed before completion"
+      assert comment =~ "agent crashed: out of memory"
+      assert comment =~ "Human Review"
+      refute comment =~ "stream events were not received"
+
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
+
+      state = :sys.get_state(pid)
+
+      refute Process.alive?(worker_pid)
+      refute Map.has_key?(state.running, issue_id)
+      assert MapSet.member?(state.completed, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
+    end
+  end
+
+  describe "vibe stall + status query inconclusive" do
+    test "status query error → explicit diagnostic, moves to Human Review, does not crash" do
       pid = start_orchestrator_with_stall(vibe_status_failure!())
       issue_id = "issue-stall-failure-#{System.unique_integer([:positive])}"
       worker_pid = inject_stalled_running_entry(pid, issue_id, "run_test_stall")
@@ -237,7 +332,8 @@ defmodule SymphonyElixir.VibeStallStatusTest do
       send(pid, :tick)
 
       assert_receive {:memory_tracker_comment, ^issue_id, comment}, 2_000
-      assert comment =~ "stalled"
+      assert comment =~ "watchdog fired"
+      assert comment =~ "could not be confirmed"
       assert comment =~ "Human Review"
 
       assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
@@ -250,7 +346,7 @@ defmodule SymphonyElixir.VibeStallStatusTest do
       refute MapSet.member?(state.claimed, issue_id)
     end
 
-    test "stall with no vibe_run_id uses stall wording and does not query status" do
+    test "stall with no vibe_run_id reports inconclusive without querying status" do
       pid = start_orchestrator_with_stall(vibe_status_failure!())
       issue_id = "issue-stall-no-run-id-#{System.unique_integer([:positive])}"
 
@@ -283,7 +379,8 @@ defmodule SymphonyElixir.VibeStallStatusTest do
       send(pid, :tick)
 
       assert_receive {:memory_tracker_comment, ^issue_id, comment}, 2_000
-      assert comment =~ "stalled"
+      assert comment =~ "watchdog fired"
+      assert comment =~ "no Vibe run_id was recorded"
       assert comment =~ "Human Review"
 
       assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
@@ -292,6 +389,40 @@ defmodule SymphonyElixir.VibeStallStatusTest do
       refute Process.alive?(worker_pid)
       refute Map.has_key?(state.running, issue_id)
       assert MapSet.member?(state.completed, issue_id)
+    end
+  end
+
+  describe "no secrets in reconciliation output" do
+    test "configured relay token never appears in the posted comment (failure path)" do
+      sentinel = "SENTINEL_RELAY_TOKEN_#{System.unique_integer([:positive])}"
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        agent_kind: "vibe",
+        tracker_kind: "memory",
+        repo_url: "https://github.com/JozzyAI/spendlens",
+        external_command: vibe_status_failed!(),
+        external_relay: "ws://127.0.0.1:65535/relay",
+        external_token: sentinel,
+        codex_stall_timeout_ms: 1_000
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      orchestrator_name = Module.concat(__MODULE__, :"SecretsOrchestrator#{System.unique_integer([:positive])}")
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+      issue_id = "issue-stall-no-secrets-#{System.unique_integer([:positive])}"
+      inject_stalled_running_entry(pid, issue_id, "run_test_stall")
+
+      send(pid, :tick)
+
+      assert_receive {:memory_tracker_comment, ^issue_id, comment}, 2_000
+      # The node-reported failure reason is surfaced, but the relay token (passed
+      # only in argv) must never leak into the Linear comment.
+      assert comment =~ "Vibe run failed before completion"
+      refute comment =~ sentinel
     end
   end
 
