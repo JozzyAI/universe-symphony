@@ -217,6 +217,38 @@ defmodule SymphonyElixir.ExternalExecutorTest do
     """)
   end
 
+  # Fake vibe that records the full `symphony start` argv (one arg per line) to
+  # `marker_path`, then emits a completed stream so run/4 returns :ok. Used to
+  # assert exactly which flags ExternalExecutor forwards to the CLI.
+  defp vibe_recording_start!(marker_path) do
+    write_fake_vibe!(~s"""
+    SUBCOMMAND="$1"
+    ACTION="$2"
+    case "$SUBCOMMAND-$ACTION" in
+      symphony-start)
+        for a in "$@"; do echo "$a" >> #{marker_path}; done
+        echo '{"run_id":"rec-run-1","session_id":"sess-rec","node_id":"node_f7cedd3b6590aff9","agent":"claude-code","status":"running","workspace_path":"/tmp","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}'
+        ;;
+      symphony-stream)
+        RUN_ID="${3:-rec-run-1}"
+        echo "{\\"type\\":\\"status\\",\\"status\\":\\"completed\\",\\"run_id\\":\\"$RUN_ID\\",\\"ts\\":\\"2026-01-01T00:00:03Z\\"}"
+        ;;
+      symphony-stop)
+        echo "{\\"run_id\\":\\"${3:-rec-run-1}\\",\\"status\\":\\"stopped\\"}"
+        ;;
+    esac
+    """)
+  end
+
+  defp recorded_args(marker), do: marker |> File.read!() |> String.split("\n", trim: true)
+
+  defp value_after(args, flag) do
+    case Enum.find_index(args, &(&1 == flag)) do
+      nil -> nil
+      i -> Enum.at(args, i + 1)
+    end
+  end
+
   # ── ExternalExecutor.run/4 tests ───────────────────────────────────────────
 
   test "completed stream returns :ok and forwards log + tool_call + vibe_start events" do
@@ -409,6 +441,89 @@ defmodule SymphonyElixir.ExternalExecutorTest do
 
     assert {:error, {:start_failed, 1, _}} =
              ExternalExecutor.run(issue, "prompt", "/tmp", command: cmd, agent: "mock")
+  end
+
+  # ── Remote dispatch argument forwarding (relay/node/token decoupling) ──────
+
+  describe "remote dispatch argument forwarding" do
+    test "forwards --relay, --node, --agent, --repo-url, --permission-mode, and --token" do
+      marker = Path.join(System.tmp_dir!(), "vibe-args-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_start!(marker)
+
+      assert :ok =
+               ExternalExecutor.run(fake_issue(), "prompt", "/tmp",
+                 command: cmd,
+                 agent: "claude-code",
+                 node: "node_f7cedd3b6590aff9",
+                 relay: "wss://vibe-relay.dynastylab.ai",
+                 token: "tok-123",
+                 repo_url: "https://github.com/JozzyAI/mirror_social",
+                 permission_mode: "unsafe-skip"
+               )
+
+      args = recorded_args(marker)
+      assert value_after(args, "--relay") == "wss://vibe-relay.dynastylab.ai"
+      assert value_after(args, "--node") == "node_f7cedd3b6590aff9"
+      assert value_after(args, "--agent") == "claude-code"
+      assert value_after(args, "--repo-url") == "https://github.com/JozzyAI/mirror_social"
+      assert value_after(args, "--permission-mode") == "unsafe-skip"
+      assert value_after(args, "--token") == "tok-123"
+    end
+
+    test "forwards --node/--relay (remote) even when token is nil — no silent local fallback" do
+      # Regression: previously a nil token dropped --node/--relay together, so
+      # vibe ran locally and exited 1 with empty stderr => {:start_failed, 1, ""}.
+      marker = Path.join(System.tmp_dir!(), "vibe-args-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_start!(marker)
+
+      assert :ok =
+               ExternalExecutor.run(fake_issue(), "prompt", "/tmp",
+                 command: cmd,
+                 agent: "claude-code",
+                 node: "node_f7cedd3b6590aff9",
+                 relay: "wss://vibe-relay.dynastylab.ai",
+                 token: nil,
+                 repo_url: "https://github.com/JozzyAI/mirror_social",
+                 permission_mode: "unsafe-skip"
+               )
+
+      args = recorded_args(marker)
+      assert value_after(args, "--node") == "node_f7cedd3b6590aff9"
+      assert value_after(args, "--relay") == "wss://vibe-relay.dynastylab.ai"
+      # token omitted so the vibe client falls back to VIBE_RELAY_TOKEN env
+      refute Enum.member?(args, "--token")
+    end
+
+    test "blank token is treated as absent (no --token, remote flags retained)" do
+      marker = Path.join(System.tmp_dir!(), "vibe-args-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_start!(marker)
+
+      assert :ok =
+               ExternalExecutor.run(fake_issue(), "prompt", "/tmp",
+                 command: cmd,
+                 agent: "claude-code",
+                 node: "node_f7cedd3b6590aff9",
+                 relay: "wss://vibe-relay.dynastylab.ai",
+                 token: ""
+               )
+
+      args = recorded_args(marker)
+      assert value_after(args, "--node") == "node_f7cedd3b6590aff9"
+      assert value_after(args, "--relay") == "wss://vibe-relay.dynastylab.ai"
+      refute Enum.member?(args, "--token")
+    end
+
+    test "pure local mode (no relay/node) adds no remote flags" do
+      marker = Path.join(System.tmp_dir!(), "vibe-args-#{System.unique_integer([:positive])}")
+      cmd = vibe_recording_start!(marker)
+
+      assert :ok = ExternalExecutor.run(fake_issue(), "prompt", "/tmp", command: cmd, agent: "mock")
+
+      args = recorded_args(marker)
+      refute Enum.member?(args, "--relay")
+      refute Enum.member?(args, "--node")
+      refute Enum.member?(args, "--token")
+    end
   end
 
   # ── ExternalExecutor.send_approval/7 tests ────────────────────────────────
