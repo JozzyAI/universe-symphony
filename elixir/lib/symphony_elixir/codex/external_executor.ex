@@ -75,7 +75,7 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   # ── Internal ───────────────────────────────────────────────────────────────
 
   defp start_run(command, agent, issue, prompt_file, node, relay, token, encrypt, repo_url, permission_mode) do
-    args =
+    base_args =
       [
         "symphony", "start",
         "--agent", agent,
@@ -85,38 +85,39 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
         "--prompt-file", prompt_file,
         "--json"
       ]
-      |> append_relay_args(node, relay, token)
       |> append_encrypt(encrypt, relay)
       |> append_repo_url(repo_url)
       |> append_permission_mode(permission_mode)
 
     Logger.info("ExternalExecutor: #{command} symphony start issue_id=#{issue.id} node=#{inspect(node)} relay=#{inspect(relay)}")
 
-    try do
-      case System.cmd(command, args, stderr_to_stdout: false) do
-        {output, 0} ->
-          case Jason.decode(String.trim(output)) do
-            {:ok, %{"run_id" => run_id} = record} when is_binary(run_id) ->
-              Logger.info("ExternalExecutor: started run_id=#{run_id}")
-              {:ok, %{
-                run_id: run_id,
-                node_id: Map.get(record, "node_id"),
-                agent: Map.get(record, "agent", agent),
-              }}
+    with_relay_args(base_args, node, relay, token, fn args ->
+      try do
+        case System.cmd(command, args, stderr_to_stdout: false) do
+          {output, 0} ->
+            case Jason.decode(String.trim(output)) do
+              {:ok, %{"run_id" => run_id} = record} when is_binary(run_id) ->
+                Logger.info("ExternalExecutor: started run_id=#{run_id}")
+                {:ok, %{
+                  run_id: run_id,
+                  node_id: Map.get(record, "node_id"),
+                  agent: Map.get(record, "agent", agent),
+                }}
 
-            {:ok, other} ->
-              {:error, {:invalid_start_response, other}}
+              {:ok, other} ->
+                {:error, {:invalid_start_response, other}}
 
-            {:error, reason} ->
-              {:error, {:invalid_start_response_json, reason, output}}
-          end
+              {:error, reason} ->
+                {:error, {:invalid_start_response_json, reason, output}}
+            end
 
-        {output, code} ->
-          {:error, {:start_failed, code, output}}
+          {output, code} ->
+            {:error, {:start_failed, code, output}}
+        end
+      rescue
+        ErlangError -> {:error, {:command_not_found, command}}
       end
-    rescue
-      ErlangError -> {:error, {:command_not_found, command}}
-    end
+    end)
   end
 
   defp stream_run(ctx, run_id, on_message) do
@@ -125,37 +126,40 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
         {:error, {:command_not_found, ctx.command}}
 
       executable ->
-        stream_args =
-          ["symphony", "stream", run_id, "--jsonl"]
-          |> append_relay_stream_args(ctx.relay, ctx.token)
+        # The token-file temp file (if any) must stay alive for the entire
+        # life of the Port subprocess, not just the spawn call -- so the
+        # whole Port.open + blocking await_stream loop runs inside the
+        # with_relay_stream_args callback, and the file is shredded only once
+        # await_stream returns (on every exit path: completed/failed/crashed).
+        with_relay_stream_args(["symphony", "stream", run_id, "--jsonl"], ctx.relay, ctx.token, fn stream_args ->
+          port =
+            Port.open(
+              {:spawn_executable, String.to_charlist(executable)},
+              [
+                :binary,
+                :exit_status,
+                args: Enum.map(stream_args, &String.to_charlist/1),
+                line: @port_line_bytes
+              ]
+            )
 
-        port =
-          Port.open(
-            {:spawn_executable, String.to_charlist(executable)},
-            [
-              :binary,
-              :exit_status,
-              args: Enum.map(stream_args, &String.to_charlist/1),
-              line: @port_line_bytes
-            ]
-          )
+          stream_os_pid =
+            case Port.info(port, :os_pid) do
+              {:os_pid, pid} -> pid
+              _ -> nil
+            end
 
-        stream_os_pid =
-          case Port.info(port, :os_pid) do
-            {:os_pid, pid} -> pid
-            _ -> nil
-          end
+          Logger.info("ExternalExecutor: streaming run_id=#{run_id} relay=#{inspect(ctx.relay)} stream_os_pid=#{inspect(stream_os_pid)}")
 
-        Logger.info("ExternalExecutor: streaming run_id=#{run_id} relay=#{inspect(ctx.relay)} stream_os_pid=#{inspect(stream_os_pid)}")
+          on_message.(%{
+            event: :vibe_stream_started,
+            run_id: run_id,
+            stream_os_pid: stream_os_pid,
+            timestamp: DateTime.utc_now()
+          })
 
-        on_message.(%{
-          event: :vibe_stream_started,
-          run_id: run_id,
-          stream_os_pid: stream_os_pid,
-          timestamp: DateTime.utc_now()
-        })
-
-        await_stream(port, run_id, ctx, on_message)
+          await_stream(port, run_id, ctx, on_message)
+        end)
     end
   end
 
@@ -305,33 +309,38 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   end
 
   def send_approval(command, run_id, approval_id, decision, relay, token, message) do
-    args =
+    base_args =
       [
         "approval", "respond",
         "--run-id", run_id,
         "--approval-id", approval_id,
         "--decision", decision,
-        "--relay", relay,
-        "--token", token
+        "--relay", relay
       ]
       |> then(fn a -> if is_binary(message), do: a ++ ["--message", message], else: a end)
 
     Logger.info("ExternalExecutor: approval respond run_id=#{run_id} approval_id=#{approval_id} decision=#{decision}")
 
-    try do
-      case System.cmd(command, args, stderr_to_stdout: false) do
-        {output, 0} ->
-          case Jason.decode(String.trim(output)) do
-            {:ok, result} -> {:ok, result}
-            {:error, reason} -> {:error, {:invalid_approval_response_json, reason, output}}
-          end
+    # The guard clause above already requires `token` to be a non-empty
+    # binary, so this always takes the token-file branch.
+    with_relay_token_file(token, fn token_args ->
+      args = base_args ++ token_args
 
-        {output, code} ->
-          {:error, {:approval_failed, code, output}}
+      try do
+        case System.cmd(command, args, stderr_to_stdout: false) do
+          {output, 0} ->
+            case Jason.decode(String.trim(output)) do
+              {:ok, result} -> {:ok, result}
+              {:error, reason} -> {:error, {:invalid_approval_response_json, reason, output}}
+            end
+
+          {output, code} ->
+            {:error, {:approval_failed, code, output}}
+        end
+      rescue
+        ErlangError -> {:error, {:command_not_found, command}}
       end
-    rescue
-      ErlangError -> {:error, {:command_not_found, command}}
-    end
+    end)
   end
 
   @spec query_run_status(String.t(), String.t(), String.t() | nil, String.t() | nil) ::
@@ -339,49 +348,45 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
           | {:error, term()}
   def query_run_status(command, run_id, relay, token)
       when is_binary(command) and is_binary(run_id) do
-    args =
-      ["symphony", "status", run_id, "--json"]
-      |> append_relay_stream_args(relay, token)
+    with_relay_stream_args(["symphony", "status", run_id, "--json"], relay, token, fn args ->
+      try do
+        case System.cmd(command, args, stderr_to_stdout: false) do
+          {output, 0} ->
+            case Jason.decode(String.trim(output)) do
+              {:ok, %{"status" => status} = record} when is_binary(status) ->
+                {:ok,
+                 %{
+                   status: status,
+                   pr_url: Map.get(record, "pr_url"),
+                   error: Map.get(record, "error")
+                 }}
 
-    try do
-      case System.cmd(command, args, stderr_to_stdout: false) do
-        {output, 0} ->
-          case Jason.decode(String.trim(output)) do
-            {:ok, %{"status" => status} = record} when is_binary(status) ->
-              {:ok,
-               %{
-                 status: status,
-                 pr_url: Map.get(record, "pr_url"),
-                 error: Map.get(record, "error")
-               }}
+              {:ok, other} ->
+                {:error, {:unexpected_status_response, other}}
 
-            {:ok, other} ->
-              {:error, {:unexpected_status_response, other}}
+              {:error, reason} ->
+                {:error, {:invalid_status_json, reason}}
+            end
 
-            {:error, reason} ->
-              {:error, {:invalid_status_json, reason}}
-          end
-
-        {_output, code} ->
-          {:error, {:status_command_failed, code}}
+          {_output, code} ->
+            {:error, {:status_command_failed, code}}
+        end
+      rescue
+        ErlangError -> {:error, {:command_not_found, command}}
       end
-    rescue
-      ErlangError -> {:error, {:command_not_found, command}}
-    end
+    end)
   end
 
   def query_run_status(_command, _run_id, _relay, _token), do: {:error, :invalid_args}
 
   def stop_run(command, run_id, relay, token) do
-    args =
-      ["symphony", "stop", run_id]
-      |> append_relay_stream_args(relay, token)
-
-    try do
-      System.cmd(command, args, stderr_to_stdout: true)
-    catch
-      _, _ -> :ok
-    end
+    with_relay_stream_args(["symphony", "stop", run_id], relay, token, fn args ->
+      try do
+        System.cmd(command, args, stderr_to_stdout: true)
+      catch
+        _, _ -> :ok
+      end
+    end)
   end
 
   # Terminates the local OS process that was opened for `vibe symphony stream
@@ -421,27 +426,68 @@ defmodule SymphonyElixir.Codex.ExternalExecutor do
   # `--token` at all. So a nil/blank token must never silently drop --node/--relay
   # and fall back to LOCAL mode — that produced `{:start_failed, 1, ""}` (vibe ran
   # locally, found no such node, exited 1 with JSON on stdout / empty stderr).
-  # We forward --node/--relay whenever both are present, and append --token only
-  # when we actually have one (otherwise the client uses its env token, or fails
-  # loudly on the relay side instead of degrading to local).
-  defp append_relay_args(args, node, relay, token)
+  # We forward --node/--relay whenever both are present, and (only when we
+  # actually have a token) call `fun` with the extra args needed to reference
+  # it via a private temp file (otherwise the vibe CLI uses its own env
+  # token, or fails loudly on the relay side instead of degrading to local).
+  defp with_relay_args(args, node, relay, token, fun)
        when is_binary(node) and node != "" and is_binary(relay) and relay != "" do
-    (args ++ ["--node", node, "--relay", relay]) |> maybe_append_token(token)
+    with_relay_token_file(token, fn token_args ->
+      fun.(args ++ ["--node", node, "--relay", relay] ++ token_args)
+    end)
   end
 
-  defp append_relay_args(args, _node, _relay, _token), do: args
+  defp with_relay_args(args, _node, _relay, _token, fun), do: fun.(args)
 
-  defp append_relay_stream_args(args, relay, token) when is_binary(relay) and relay != "" do
-    (args ++ ["--relay", relay]) |> maybe_append_token(token)
+  defp with_relay_stream_args(args, relay, token, fun) when is_binary(relay) and relay != "" do
+    with_relay_token_file(token, fn token_args ->
+      fun.(args ++ ["--relay", relay] ++ token_args)
+    end)
   end
 
-  defp append_relay_stream_args(args, _relay, _token), do: args
+  defp with_relay_stream_args(args, _relay, _token, fun), do: fun.(args)
 
-  defp maybe_append_token(args, token) when is_binary(token) and token != "" do
-    args ++ ["--token", token]
+  # Writes `token` to a private temp file (created empty, chmod'd 0600, THEN
+  # written, to minimize the window the content could be readable by another
+  # local user) and calls `fun` with the CLI args needed to reference it
+  # (`["--token-file", path]`) instead of ever passing `--token <value>` --
+  # so the token never appears in this process's own argv, and therefore
+  # never in `ps`/`/proc/<pid>/cmdline` for any vibe CLI subprocess spawned
+  # below. The file is shredded (zeroed) and deleted in an `after` block, so
+  # it is gone by the time `fun` returns or raises -- including for
+  # long-running callers like stream_run, where `fun` is the entire
+  # Port.open + blocking await_stream lifetime, so the file lives exactly as
+  # long as the subprocess that needs it.
+  #
+  # When `token` is nil/blank, calls `fun` with no extra args at all (no
+  # --token, no --token-file) -- preserving the "never silently drop
+  # --node/--relay" behavior from the comment above.
+  defp with_relay_token_file(token, fun) when is_binary(token) and token != "" do
+    path = Path.join(System.tmp_dir!(), "vibe-relay-token-#{System.unique_integer([:positive])}")
+    File.touch!(path)
+    File.chmod!(path, 0o600)
+    File.write!(path, token)
+
+    try do
+      fun.(["--token-file", path])
+    after
+      shred_token_file(path)
+    end
   end
 
-  defp maybe_append_token(args, _token), do: args
+  defp with_relay_token_file(_token, fun), do: fun.([])
+
+  defp shred_token_file(path) do
+    case File.stat(path) do
+      {:ok, %{size: size}} when size > 0 -> File.write(path, :binary.copy(<<0>>, size))
+      _ -> :ok
+    end
+
+    File.rm(path)
+    :ok
+  rescue
+    _ -> :ok
+  end
 
   # Only add --encrypt when relay is configured and encrypt is explicitly true.
   # Encrypting local runs has no effect (no relay to be blind to the payload).
