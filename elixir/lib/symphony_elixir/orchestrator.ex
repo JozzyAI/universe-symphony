@@ -1465,8 +1465,9 @@ defmodule SymphonyElixir.Orchestrator do
     issue = running_entry.issue
     vibe_run_id = Map.get(running_entry, :vibe_run_id)
     vibe_stream_os_pid = Map.get(running_entry, :vibe_stream_os_pid)
+    {relay, token} = resolve_vibe_relay_token(issue)
 
-    case query_vibe_run_status(vibe_run_id) do
+    case query_vibe_run_status(vibe_run_id, relay, token) do
       {:completed, pr_url} when is_binary(pr_url) and pr_url != "" ->
         Logger.info("Vibe watchdog: #{log_ctx}; node reports COMPLETED with PR — reconciling as success (not a stall)")
 
@@ -1503,7 +1504,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> terminate_running_issue(issue_id, false)
           |> finish_issue_without_pr(issue_id, issue, "Vibe run failed before completion: #{node_reason}")
 
-        maybe_stop_vibe_run(vibe_run_id)
+        maybe_stop_vibe_run(vibe_run_id, relay, token)
         maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
         result_state
 
@@ -1519,7 +1520,7 @@ defmodule SymphonyElixir.Orchestrator do
             "agent run stalled for #{elapsed_ms}ms without activity (the node still reports the run as running)."
           )
 
-        maybe_stop_vibe_run(vibe_run_id)
+        maybe_stop_vibe_run(vibe_run_id, relay, token)
         maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
         result_state
 
@@ -1536,9 +1537,36 @@ defmodule SymphonyElixir.Orchestrator do
               "(#{diagnostic}), so completion could not be confirmed — please verify the run and repository manually."
           )
 
-        maybe_stop_vibe_run(vibe_run_id)
+        maybe_stop_vibe_run(vibe_run_id, relay, token)
         maybe_kill_vibe_stream(vibe_stream_os_pid, vibe_run_id)
         result_state
+    end
+  end
+
+  # Resolves the relay/token that should be used to reach the node a Vibe run
+  # was actually dispatched to — the SAME source `run_codex_turns/5` resolves
+  # for the original `vibe symphony start`/`stream` calls (the issue's node
+  # binding under WORKFLOW.md's `binding.nodes.<name>`), NOT
+  # `config.external.relay`/`config.external.token`. Those top-level fields
+  # are normally unset (this deployment's `external:` section only sets
+  # `command`), and ExternalExecutor's CLI arg builder silently drops
+  # `--relay`/`--token` when relay is nil — degrading the query/stop call to
+  # LOCAL mode on the Symphony host instead of asking the real node. That is
+  # the confirmed root cause of the JOZ-37 stale "running" read: the watchdog
+  # ended up reading a stale local run-record stub (created at dispatch time,
+  # never updated) instead of the owning node's authoritative record.
+  # Falls back to `config.external.relay/token` only if binding resolution
+  # itself fails (e.g. labels changed mid-run) — never worse than the
+  # pre-fix behavior, just no longer the default path.
+  defp resolve_vibe_relay_token(issue) do
+    config = Config.settings!()
+
+    case Binding.resolve(issue, config) do
+      {:ok, %{relay: relay, token: token}} when is_binary(relay) and relay != "" ->
+        {relay, token}
+
+      _ ->
+        {config.external.relay, config.external.token}
     end
   end
 
@@ -1546,14 +1574,14 @@ defmodule SymphonyElixir.Orchestrator do
   # a reconcilable outcome. Missing run_id or any query error degrades to
   # {:unknown, _} so the caller falls back to Human Review rather than silently
   # false-parking — preserving the conservative behavior for genuine stalls.
-  defp query_vibe_run_status(vibe_run_id) when is_binary(vibe_run_id) do
+  defp query_vibe_run_status(vibe_run_id, relay, token) when is_binary(vibe_run_id) do
     config = Config.settings!()
 
     case SymphonyElixir.Codex.ExternalExecutor.query_run_status(
            config.external.command,
            vibe_run_id,
-           config.external.relay,
-           config.external.token
+           relay,
+           token
          ) do
       {:ok, %{status: "completed"} = result} ->
         {:completed, Map.get(result, :pr_url)}
@@ -1572,7 +1600,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp query_vibe_run_status(_vibe_run_id) do
+  defp query_vibe_run_status(_vibe_run_id, _relay, _token) do
     {:unknown, "no Vibe run_id was recorded for this issue"}
   end
 
@@ -1595,18 +1623,31 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Stops the Vibe relay run after a stall so any lingering stream process can
   # exit. Best-effort: errors are caught inside stop_run/4 itself.
-  defp maybe_stop_vibe_run(vibe_run_id) when is_binary(vibe_run_id) do
+  defp maybe_stop_vibe_run(vibe_run_id, relay, token) when is_binary(vibe_run_id) do
     config = Config.settings!()
-    SymphonyElixir.Codex.ExternalExecutor.stop_run(config.external.command, vibe_run_id, config.external.relay, config.external.token)
+    SymphonyElixir.Codex.ExternalExecutor.stop_run(config.external.command, vibe_run_id, relay, token)
   end
 
-  defp maybe_stop_vibe_run(_vibe_run_id), do: :ok
+  defp maybe_stop_vibe_run(_vibe_run_id, _relay, _token), do: :ok
 
   defp maybe_kill_vibe_stream(os_pid, run_id) when is_integer(os_pid) and is_binary(run_id) do
     SymphonyElixir.Codex.ExternalExecutor.kill_stream_process(os_pid, run_id)
   end
 
-  defp maybe_kill_vibe_stream(_os_pid, _run_id), do: :ok
+  # Silent no-op when the stream os_pid was never captured on the running
+  # entry (e.g. is_binary(run_id) fails too, or the :vibe_stream_started
+  # update never arrived) — previously this left no trace, so an orphaned
+  # `vibe symphony stream` process (observed live: JOZ-37 run_mqq0yg3t_5871e4,
+  # Mac PID 98413, never reaped after reconciliation) was indistinguishable
+  # from "nothing to clean up". Log so a future occurrence is diagnosable.
+  defp maybe_kill_vibe_stream(os_pid, run_id) do
+    Logger.warning(
+      "Vibe watchdog: no stream os_pid to clean up for run_id=#{inspect(run_id)} (os_pid=#{inspect(os_pid)}) — " <>
+        "stream process, if any, was not terminated by reconciliation"
+    )
+
+    :ok
+  end
 
   defp agent_kind_vibe? do
     Config.settings!().agent_kind == "vibe"
